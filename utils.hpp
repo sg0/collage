@@ -49,4 +49,48 @@ do { \
     MPI_Comm_free(&comm_); \
     } while(0)
 
+#ifndef TAG_ALLTOALLV
+#define TAG_ALLTOALLV              (101)
+#endif
+
+#ifndef TAG_ALLTOALL
+#define TAG_ALLTOALL               (102)
+#endif
+
+#ifndef TAG_ALLREDUCE
+#define TAG_ALLREDUCE              (103) 
+#endif
+
+#ifndef TAG_ALLGATHERV
+#define TAG_ALLGATHERV             (104)
+#endif
+
+#ifndef TAG_ALLGATHER
+#define TAG_ALLGATHER              (105)
+#endif
+
+#ifndef TAG_BARRIER
+#define TAG_BARRIER                (106)
+#endif
+
+#ifndef TAG_BCAST
+#define TAG_BCAST                  (107)
+#endif
+
+#ifndef TAG_REDUCE
+#define TAG_REDUCE                 (108)
+#endif
+
+#ifndef TAG_SCATTER
+#define TAG_SCATTER                (109)
+#endif
+
+#ifndef TAG_REDUCE_SCATTER
+#define TAG_REDUCE_SCATTER         (201)
+#endif
+
+#ifndef TAG_REDUCE_SCATTER_BLOCK
+#define TAG_REDUCE_SCATTER_BLOCK   (202)
+#endif
+
 #endif
