@@ -45,12 +45,12 @@ class Alltoallv
             packed_size = rcounts[i] * sizeof(T);
             max_size = std::max(packed_size, max_size);
         }
-
+               
         if ((1 == size) || (0 == max_size) )
             return;
-
+        
         /* Allocate a temporary buffer */
-        tmp_buffer.resize(max_size, 1);
+        tmp_buffer.resize(max_size, 0);
 
         for (i = 1 ; i <= (size >> 1) ; ++i) 
         {
@@ -59,8 +59,12 @@ class Alltoallv
 
             /* nothing to exchange with the peer on the right */
             if (rcounts[right] != 0) 
-            {  
-                MPI_Irecv((char *)rbuf + rdisps[right] * sizeof(T),
+            { 
+                /// prepare tmp buffer for sending
+                packed_size = max_size;
+                MPI_Pack((T *)rbuf + rdisps[right] * sizeof(T), rcounts[right], TypeMap<T>(), tmp_buffer.data(), max_size, &packed_size, comm_);
+
+                MPI_Irecv((T *)rbuf + rdisps[right] * sizeof(T),
                         rcounts[right], TypeMap<T>(),
                         right, TAG_ALLTOALLV, comm_, &req);
             }
@@ -69,14 +73,14 @@ class Alltoallv
             if ((left != right) && (rcounts[left] != 0)) 
             {
                 /* Send data to the left */
-                MPI_Send((char *)rbuf + rdisps[left] * sizeof(T),
+                MPI_Send((T *)rbuf + rdisps[left] * sizeof(T),
                         rcounts[left], TypeMap<T>(),
                         left, TAG_ALLTOALLV, comm);
 
-                MPI_Wait(&req, MPI_STATUSES_IGNORE);
+                MPI_Wait(&req, MPI_STATUS_IGNORE);
 
                 /* Receive data from the left */
-                MP_Irecv((char *)rbuf + rdisps[left] * sizeof(T),
+                MP_Irecv((T *)rbuf + rdisps[left] * sizeof(T),
                         rcounts[left], TypeMap<T>(),
                         left, TAG_ALLTOALLV, comm_, &req);
             }
@@ -85,19 +89,18 @@ class Alltoallv
             if (rcounts[right] != 0) 
             {  
                 /* Send data to the right */
-                MPI_Send((char *)tmp_buffer.data(), packed_size, MPI_BYTE,
+                MPI_Send((char *)tmp_buffer.data(), packed_size, MPI_PACKED,
                         right, TAG_ALLTOALLV, comm_);
             }
 
-            MPI_Wait(&req, MPI_STATUSES_IGNORE);
+            MPI_Wait(&req, MPI_STATUS_IGNORE);
         }
 
         tmp_buffer.clear();
     }
 
     /// 2. pairwise
-	int
-		ompi_coll_base_alltoallv_intra_pairwise(const void *sbuf, ompi_count_array_t scounts, ompi_disp_array_t sdisps,
+	void pairwise(const void *sbuf, ompi_count_array_t scounts, ompi_disp_array_t sdisps,
 				struct ompi_datatype_t *sdtype,
 				void* rbuf, ompi_count_array_t rcounts, ompi_disp_array_t rdisps,
 				struct ompi_datatype_t *rdtype,
