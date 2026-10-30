@@ -235,4 +235,5 @@ reference. It then re-initialises the inputs, runs each algorithm once on
 poisoned output buffers, and compares the result element by element. The
 comparison covers the root for rooted collectives and every rank otherwise.
 Inputs are small integers chosen per operation, so floating-point sums and
-products are exact whatever the reduction order.
+products are exact whatever the reduction order. Exhaustive verification is 
+ongoing.
