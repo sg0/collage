@@ -1,6 +1,6 @@
 # collage — point-to-point collective algorithm benchmark
 
-`collage` benchmarks the collective algorithms from Open MPI's `coll/base`
+`collage` benchmarks the collective algorithms from OpenMPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
 is re-implemented with plain MPI point-to-point calls. You pick one collective,
 and `collage` times every algorithm for it (plus the MPI library's own
@@ -10,7 +10,7 @@ the native MPI collective.
 
 The algorithm set is taken from the specific commit; no new algorithms or options were added. 
 This work was solely possible due to the implicit generosity and dedication of the MPI implementers,
-researchers, and, broadly the MPI Forum for steering HPC ahead.    
+researchers, and, broadly the MPI Forum for steering HPC ahead through the past decades.    
 
 ## Layout
 
