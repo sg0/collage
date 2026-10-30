@@ -12,7 +12,7 @@ The algorithm set is taken from the specific commit; no new algorithms or option
 Dependencies such as internal tree and pipeline construction routines were also taken from OpenMPI
 implementation. As such, there is little novelty in this codebase: this work was solely possible due 
 to the implicit generosity and dedication of the MPI implementers, researchers, and, broadly the 
-MPI Forum for steering HPC ahead through the past decades.    
+MPI Forum for continuing to steer HPC ahead.    
 
 ## Layout
 
