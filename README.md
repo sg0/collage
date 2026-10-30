@@ -10,9 +10,9 @@ the native MPI collective.
 
 The algorithm set is taken from the specific commit; no new algorithms or options were added. 
 Dependencies such as internal tree and pipeline construction routines were also taken from OpenMPI
-implementation. As such, there is little novelty in this codebase: this work was solely possible due 
-to the implicit generosity and dedication of the MPI implementers, researchers, and, broadly the 
-MPI Forum for continuing to steer HPC ahead.    
+implementation. As such, there is little novelty in this codebase since this is mostly vibe-coding
+on existing work. I would like to acknowledge the implicit generosity and dedication of the 
+MPI implementers, researchers, and, broadly the MPI Forum for continuing to steer HPC ahead.    
 
 ## Layout
 
