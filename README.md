@@ -9,8 +9,10 @@ is 0 B to 4 MiB in powers of two. It can optionally check each result against
 the native MPI collective.
 
 The algorithm set is taken from the specific commit; no new algorithms or options were added. 
-This work was solely possible due to the implicit generosity and dedication of the MPI implementers,
-researchers, and, broadly the MPI Forum for steering HPC ahead through the past decades.    
+Dependencies such as internal tree and pipeline construction routines were also taken from OpenMPI
+implementation. As such, there is little novelty in this codebase: this work was solely possible due 
+to the implicit generosity and dedication of the MPI implementers, researchers, and, broadly the 
+MPI Forum for steering HPC ahead through the past decades.    
 
 ## Layout
 
