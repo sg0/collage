@@ -45,20 +45,20 @@ above `INT_MAX` raises an error.
 
 ```bash
 # all allreduce algorithms, 0..4 MiB, float sum, verified against MPI_Allreduce
-mpirun -np 128 ./collage -c allreduce -t float -o sum --check
+mpiexec -n 128 ./collage -c allreduce -t float -o sum --check
 
 # a non-builtin and a non-commutative reduction
-mpirun -np 128 ./collage -c reduce -o user
-mpirun -np 128 ./collage -c reduce -o user_nc
+mpiexec -n 128 ./collage -c reduce -o user
+mpiexec -n 128 ./collage -c reduce -o user_nc
 
 # a few bcast algorithms with a segment-size sweep (one column per value)
-mpirun -np 256 ./collage -c bcast -a binomial,pipeline,knomial,native -s 0,8K,64K -k 2,4
+mpiexec -n 256 ./collage -c bcast -a binomial,pipeline,knomial,native -s 0,8K,64K -k 2,4
 
 # irregular alltoallv counts, explicit sizes, statistics to CSV
-mpirun -np 64 ./collage -c alltoallv --vdist random --sizes 0,64,1K,64K,1M,4M --csv a2av.csv
+mpiexec -n 64 ./collage -c alltoallv --vdist random --sizes 0,64,1K,64K,1M,4M --csv a2av.csv
 
 # correctness only (fast, good for CI); exit status 2 on any mismatch
-mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
+mpiexec -n 7 ./collage -c reduce_scatter -o user_nc --check-only
 
 ./collage --list        # collectives, algorithms and the tunables each one uses
 ./collage --help
