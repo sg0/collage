@@ -239,3 +239,9 @@ comparison covers the root for rooted collectives and every rank otherwise.
 Inputs are small integers chosen per operation, so floating-point sums and
 products are exact whatever the reduction order. Exhaustive verification is 
 ongoing.
+
+## License
+
+collage is distributed under the 3-clause BSD license. The algorithm headers
+are derived from OpenMPI and also carry OpenMPI's BSD license and copyright
+notices. See [LICENSE](LICENSE) for both.
