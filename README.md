@@ -58,6 +58,9 @@ mpirun -np 64 ./collage -c alltoallv --vdist random --sizes 0,64,1K,64K,1M,4M --
 # correctness only (fast, good for CI); exit status 2 on any mismatch
 mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 
+# concurrent groups; run allgather on 4 rings 
+mpirun -np 32 ./collage -c allgather -a ring -s 0,8K,64K -split-mask=8
+
 ./collage --list        # collectives, algorithms and the tunables each one uses
 ./collage --help
 ```
