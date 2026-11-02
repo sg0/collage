@@ -68,6 +68,7 @@ struct Options {
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
     bool quiet = false;
+    int split_mask = 0;                     /* >0: run on N/M concurrent groups of M ranks */
 };
 
 /* parameters handed to one algorithm variant */
@@ -811,7 +812,9 @@ struct Variant {
 
 struct Cell {
     enum State { Ok, NA, Skip, Fail } state = Ok;
-    double avg = 0, min = 0, max = 0;  /* microseconds */
+    double avg = 0, min = 0, max = 0;  /* microseconds: mean / min / max over all ranks */
+    double gmin = 0, gmax = 0;         /* microseconds: min / max over groups of the group mean */
+    double aggbw = 0;                  /* MB/s: sum over groups of payload / group mean */
     std::string note;
 };
 
@@ -899,12 +902,28 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
     int rank, size;
     MPI_Comm_rank(world, &rank);
     MPI_Comm_size(world, &size);
-    if (o.root < 0 || o.root >= size) throw std::invalid_argument("--root out of range");
+
+    /* --split-mask M: N/M groups of M consecutive ranks, each running its own
+     * instance of the collective concurrently. Without it: one group = world. */
+    int gsize = size, groups = 1;
+    MPI_Comm comm = world;
+    if (o.split_mask > 0) {
+        if (o.split_mask > size || size % o.split_mask != 0)
+            throw std::invalid_argument("--split-mask " + std::to_string(o.split_mask) +
+                                        " must divide the number of processes (" + std::to_string(size) + ")");
+        gsize = o.split_mask;
+        groups = size / gsize;
+        MPI_CHECK(MPI_Comm_split(world, rank / gsize, rank, &comm));
+    }
+    if (o.root < 0 || o.root >= gsize)
+        throw std::invalid_argument("--root out of range (must be < " + std::to_string(gsize) +
+                                    (o.split_mask > 0 ? ", the group size)" : ")"));
 
     OpInfo op = make_op<T>(o.op);
     int exit_code = 0;
     {
-        auto runner = make_runner<T>(o.coll, world, o, op);
+        /* the runner (and every algorithm object) lives on the group communicator */
+        auto runner = make_runner<T>(o.coll, comm, o, op);
         auto defs = runner->algorithms();
         if (!o.algos.empty()) {
             for (auto& a : o.algos) {
@@ -925,18 +944,25 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             std::printf("# collage: point-to-point collective algorithm benchmark\n");
             std::printf("# MPI library  : %s\n", v.c_str());
             std::printf("# collective   : %s (%d ranks)\n", o.coll.c_str(), size);
+            if (o.split_mask > 0)
+                std::printf("# groups       : %d concurrent communicators of %d consecutive ranks (--split-mask %d)\n",
+                            groups, gsize, o.split_mask);
             std::printf("# size means   : %s\n", runner->size_semantics());
             std::printf("# datatype     : %s (%zu bytes)\n", type_name.c_str(), sizeof(T));
             if (runner->reduction())
                 std::printf("# operation    : %s (%s)\n", op.name.c_str(), op.commute ? "commutative" : "non-commutative");
             if (o.coll == "bcast" || o.coll == "reduce" || o.coll == "gather" || o.coll == "scatter")
-                std::printf("# root         : %d\n", o.root);
+                std::printf("# root         : %d%s\n", o.root, o.split_mask > 0 ? " (rank within each group)" : "");
             if (o.coll == "alltoallv" || o.coll == "allgatherv" || o.coll == "reduce_scatter")
                 std::printf("# distribution : %s (seed %u)\n", o.vdist.c_str(), o.seed);
             std::printf("# iterations   : %d (warmup %d), %d (warmup %d) above %s\n", o.iters, o.warmup,
                         o.iters_large, o.warmup_large, human_bytes(o.large_threshold).c_str());
             std::printf("# check        : %s\n", o.check || o.check_only ? "against native MPI" : "off");
-            std::printf("# times        : average latency in microseconds (mean over ranks)\n");
+            if (o.split_mask > 0)
+                std::printf("# times        : latency in microseconds, mean over the ranks of a group,\n"
+                            "#                averaged over the %d groups (all groups start together)\n", groups);
+            else
+                std::printf("# times        : average latency in microseconds (mean over ranks)\n");
             std::fflush(stdout);
         }
 
@@ -1009,10 +1035,23 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     MPI_Allreduce(&mine, &tot, 1, MPI_DOUBLE, MPI_SUM, world);
                     MPI_Allreduce(&mine, &mn, 1, MPI_DOUBLE, MPI_MIN, world);
                     MPI_Allreduce(&mine, &mx, 1, MPI_DOUBLE, MPI_MAX, world);
+                    /* group statistics: latency of a group = mean over its ranks */
+                    double gsum = 0;
+                    MPI_Allreduce(&mine, &gsum, 1, MPI_DOUBLE, MPI_SUM, comm);
+                    const double gmean = gsum / gsize;
+                    /* every rank contributes 1/gsize of its group's value -> sums over groups */
+                    double gbw = gmean > 0 ? runner->payload_bytes(n) / gmean : 0.0; /* B/us == MB/s */
+                    double contrib = gbw / gsize, aggbw = 0, gmn = 0, gmx = 0;
+                    MPI_Allreduce(&contrib, &aggbw, 1, MPI_DOUBLE, MPI_SUM, world);
+                    MPI_Allreduce(&gmean, &gmn, 1, MPI_DOUBLE, MPI_MIN, world);
+                    MPI_Allreduce(&gmean, &gmx, 1, MPI_DOUBLE, MPI_MAX, world);
                     if (cell.state != Cell::Fail) cell.state = Cell::Ok;
-                    cell.avg = tot / size;
+                    cell.avg = tot / size;  /* == mean over groups (equal group sizes) */
                     cell.min = mn;
                     cell.max = mx;
+                    cell.gmin = gmn;
+                    cell.gmax = gmx;
+                    cell.aggbw = aggbw;
                 } catch (const NotApplicable& e) {
                     cell.state = Cell::NA;
                     cell.note = e.what();
@@ -1052,6 +1091,32 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             }
         }
 
+        /* with concurrent groups, also report the aggregate bandwidth */
+        if (rank == 0 && !o.quiet && o.split_mask > 0 && !o.check_only && runner->sized()) {
+            std::printf("#\n# aggregate bandwidth in MB/s: sum over the %d groups of\n"
+                        "# (bytes per rank: %s) / (group latency)\n", groups, runner->size_semantics());
+            std::printf("%-12s", "# bytes");
+            for (auto& v : variants) std::printf(" %*s", (int)std::max<size_t>(12, v.label.size()), v.label.c_str());
+            std::printf("\n");
+            for (size_t ci = 0; ci < counts.size(); ++ci) {
+                std::printf("%-12zu", counts[ci] * sizeof(T));
+                for (size_t vi = 0; vi < variants.size(); ++vi) {
+                    const Cell& c = results[ci][vi];
+                    int w = (int)std::max<size_t>(12, variants[vi].label.size());
+                    char buf[64];
+                    switch (c.state) {
+                        case Cell::Ok: std::snprintf(buf, sizeof buf, "%.2f", c.aggbw); break;
+                        case Cell::NA: std::snprintf(buf, sizeof buf, "n/a"); break;
+                        case Cell::Skip: std::snprintf(buf, sizeof buf, "skip"); break;
+                        case Cell::Fail: std::snprintf(buf, sizeof buf, "FAIL:%.2f", c.aggbw); break;
+                    }
+                    std::printf(" %*s", w, buf);
+                }
+                std::printf("\n");
+            }
+            std::fflush(stdout);
+        }
+
         if (rank == 0 && !o.quiet) {
             /* explain n/a cells once */
             std::map<std::string, std::string> notes;
@@ -1068,8 +1133,8 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             if (!f) {
                 std::fprintf(stderr, "cannot open %s for writing\n", o.csv.c_str());
             } else {
-                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,root,bytes,count,status,"
-                                "avg_us,min_us,max_us,algbw_MBps,note\n");
+                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,groups,group_ranks,root,bytes,count,"
+                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
                         const Cell& c = results[ci][vi];
@@ -1081,18 +1146,20 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                         if ((c.state == Cell::Ok || c.state == Cell::Fail) && c.avg > 0) bw = pb / c.avg;  /* B/us == MB/s */
                         std::string note = c.note;
                         std::replace(note.begin(), note.end(), ',', ';');
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.2f,%s\n", o.coll.c_str(),
-                                     variants[vi].base.c_str(), variants[vi].label.c_str(), type_name.c_str(),
-                                     runner->reduction() ? op.name.c_str() : "-", size, o.root, bytes, counts[ci], st,
-                                     c.avg, c.min, c.max, bw, note.c_str());
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s\n",
+                                     o.coll.c_str(), variants[vi].base.c_str(), variants[vi].label.c_str(),
+                                     type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, groups,
+                                     gsize, o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw,
+                                     c.aggbw, note.c_str());
                     }
                 std::fclose(f);
                 if (!o.quiet) std::printf("# statistics written to %s\n", o.csv.c_str());
             }
         }
         exit_code = failures ? 2 : 0;
-    }
+    }  /* runner and its dup'ed communicators are released here */
     free_op(op);
+    if (comm != world) MPI_Comm_free(&comm);
     return exit_code;
 }
 

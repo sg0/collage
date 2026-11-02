@@ -100,6 +100,13 @@ void usage()
         "      --max-reqs LIST    max outstanding requests, 0 = unlimited (default 0)\n"
         "      --first-seg LIST   gather linear_sync first segment bytes (default 1K)\n"
         "\n"
+        "concurrent groups\n"
+        "      --split-mask M     split the N processes into N/M communicators of M\n"
+        "                         consecutive ranks and run every algorithm on all of\n"
+        "                         them at the same time (M must divide N; --root is\n"
+        "                         the rank within a group). Reports the mean latency\n"
+        "                         over groups and the aggregate bandwidth.\n"
+        "\n"
         "measurement\n"
         "  -i, --iters N          timed iterations (default 100)\n"
         "  -w, --warmup N         warm-up iterations (default 10)\n"
@@ -123,10 +130,10 @@ Options parse(int argc, char** argv, bool& list, bool& help)
     };
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        /* allow --opt=value */
+        /* allow --opt=value (and -opt=value) */
         std::string val;
         bool has_eq = false;
-        if (a.rfind("--", 0) == 0 && a.find('=') != std::string::npos) {
+        if (a.rfind("-", 0) == 0 && a.find('=') != std::string::npos) {
             val = a.substr(a.find('=') + 1);
             a = a.substr(0, a.find('='));
             has_eq = true;
@@ -162,6 +169,7 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--check-only") o.check_only = true;
         else if (a == "--csv") o.csv = v();
         else if (a == "-q" || a == "--quiet") o.quiet = true;
+        else if (a == "--split-mask" || a == "-split-mask") o.split_mask = std::stoi(v());
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
         else throw std::invalid_argument("unknown option '" + a + "' (see --help)");
     }
@@ -172,6 +180,7 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         if (f < 1 || f > MAXTREEFANOUT) throw std::invalid_argument("--fanout values must be in [1, 32]");
     if (o.iters < 0 || o.warmup < 0 || o.iters_large < 0 || o.warmup_large < 0)
         throw std::invalid_argument("iteration counts must be >= 0");
+    if (o.split_mask < 0) throw std::invalid_argument("--split-mask must be >= 1");
     return o;
 }
 
