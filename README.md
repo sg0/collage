@@ -58,9 +58,6 @@ mpirun -np 64 ./collage -c alltoallv --vdist random --sizes 0,64,1K,64K,1M,4M --
 # correctness only (fast, good for CI); exit status 2 on any mismatch
 mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 
-# concurrent groups; run allgather on 4 rings 
-mpirun -np 32 ./collage -c allgather -a ring -s 0,8K,64K -split-mask=8
-
 ./collage --list        # collectives, algorithms and the tunables each one uses
 ./collage --help
 ```
@@ -87,7 +84,7 @@ mpirun -np 32 ./collage -c allgather -a ring -s 0,8K,64K -split-mask=8
 | `--max-mem B` | skip cases whose buffers exceed `B` per rank | `2G` |
 | `--check`, `--check-only` | verify against native MPI (and time / don't time) | off |
 | `--csv FILE` | `avg/min/max` µs and algorithmic bandwidth per (variant, size) | – |
-| `--split-mask M` | run on N/M concurrent communicators of M ranks (see below) | off |
+| `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
 
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
@@ -132,14 +129,71 @@ themselves only use point-to-point calls, derived datatypes and
 
 ```bash
 # 32 ranks -> 4 communicators of 8 ranks, 4 rings running at the same time
-mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8
+mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8       # consecutive
+mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8:4     # members 4 apart
+mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8:0.45  # randomised, p = 0.45
 ```
 
-`--split-mask M` splits the N processes into N/M communicators of M
-consecutive ranks (`MPI_Comm_split` with colour `rank / M`); M must divide N.
-Every algorithm then runs on all groups at once. Each group has its own
-instance of the collective, so `ring` gives N/M independent rings and a rooted
-collective has one root per group. `--root` is the rank *within* a group.
+`--split-mask M[:K|:p]` splits the N processes into N/M communicators of M
+ranks each; M must divide N. Every algorithm then runs on all groups at once.
+Each group has its own instance of the collective, so `ring` gives N/M
+independent rings and a rooted collective has one root per group. Think of the
+ranks as laid out in a straight line. Which ranks form a group is set by the
+optional suffix:
+
+* **`M:K`: fixed stride.** The members of a group are exactly K ranks apart.
+  The line is cut into blocks of M·K consecutive ranks, and each block holds K
+  interleaved groups: `{b·MK + j + i·K : i = 0..M−1}` for `j = 0..K−1`. N must
+  be divisible by M·K. `K = 1` (also what plain `M` means) gives consecutive
+  ranks, and `K = N/M` gives `rank % (N/M)`. Example with N = 32 and
+  `--split-mask=8:2`: `{0,2,…,14}`, `{1,3,…,15}`, `{16,18,…,30}`,
+  `{17,19,…,31}`.
+* **`M:p`: randomised members, p ∈ [0, 1].** The group size stays M, but the
+  members are reshuffled from the consecutive layout. The tool performs about
+  p·N/2 swaps. Each swap exchanges two not-yet-moved ranks from different
+  groups that are at most `R = M·(N/M)^p` apart on the line. As a result,
+  about a fraction p of all members end up outside their consecutive group:
+  `8:0.5` is a 50-50 chance per member. Low p keeps groups nearly
+  consecutive, and a foreign member typically comes from the adjoining group
+  (at most about two groups away). High p moves almost every rank, over
+  distances up to the whole line. This differs from `M:K`, where the distance
+  between members is fixed. p is told apart from K by its decimal point:
+  `8:1` is stride 1, `8:1.0` is p = 1, and `8:0.0` is the consecutive layout.
+  The layout is drawn with `--seed` (default 42) on rank 0 and broadcast, so a
+  given seed always reproduces the same groups.
+
+Every run, with or without `--split-mask`, starts with a group-layout report.
+Without the option, the report describes a single group of all N ranks on
+`MPI_COMM_WORLD`:
+
+```
+# groups       : 4 concurrent communicators of 8 ranks, members 4 ranks apart (--split-mask 8:4)
+# layout       : 4/4 groups non-consecutive, 75% of ranks outside their consecutive group,
+#                mean member gap 4.00, max group span 28
+# nodes        : 4 nodes, 8 ranks per node, block placement (consecutive ranks share a node)
+#                each group spans 4..4 nodes (mean 4.00); 0/4 groups are intra-node
+#   group 0    : {0,4,8,12,16,20,24,28}  (4 nodes)
+#   ...
+```
+
+The report contains:
+
+* how the groups were formed;
+* how far the layout is from consecutive: the number of non-consecutive
+  groups, the fraction of ranks outside their consecutive group, the mean gap
+  between neighbouring members and the largest group span;
+* how the ranks sit on nodes: the node count, ranks per node, and whether
+  the launcher placed ranks in blocks or round-robin;
+* how many nodes each group spans, and how many groups stay inside one node;
+* the first four groups' members, each with its node count.
+
+Nodes are identified by host name (`MPI_Get_processor_name`). The report shows
+how a given layout interacts with the launcher's placement. For example,
+`8:4` spreads every group over 4 nodes with block placement, but keeps each
+group on a single node with round-robin placement.
+
+Inside a group, ranks are ordered by world rank, and `--root` is the rank
+*within* a group.
 
 * All groups start each timed iteration together: the barrier before every
   iteration is on `MPI_COMM_WORLD`. The groups therefore contend for the
@@ -149,14 +203,16 @@ collective has one root per group. `--root` is the rank *within* a group.
 * **Aggregate bandwidth table** (printed after the latency table): the sum over
   groups of `bytes / group latency` in MB/s, where `bytes` follows the
   per-collective meaning of "size" above.
-* **CSV:** adds `groups`, `group_ranks`, `group_min_us` / `group_max_us`
-  (the fastest and slowest group) and `aggbw_MBps`.
+* **CSV:** adds `groups`, `group_ranks`, `layout` (`consecutive`, `stride=K`
+  or `random:p=P:seed=S`), `group_min_us` / `group_max_us` (the fastest and
+  slowest group) and `aggbw_MBps`.
 * `--check` verifies every group against the native collective on that
   group's communicator.
 
-Groups are blocks of consecutive ranks, so how they map onto nodes depends on
-how the launcher places ranks. For example, with 8 ranks per node packed by
-core, `--split-mask 8` puts each group inside one node.
+How groups map onto nodes depends on how the launcher places ranks. For
+example, with 8 ranks per node packed by core, `--split-mask 8` puts each
+group inside one node, `--split-mask 8:K` with K ≥ 8 spreads each group over
+8 nodes, and `M:p` gives everything in between.
 
 ## Reduction operations
 

@@ -69,6 +69,9 @@ struct Options {
     std::string csv;                        /* write full statistics */
     bool quiet = false;
     int split_mask = 0;                     /* >0: run on N/M concurrent groups of M ranks */
+    int split_stride = 1;                   /* M:K  -> members exactly K ranks apart */
+    double split_p = -1.0;                  /* M:p  -> randomised layout, p in [0,1] (<0: off) */
+    std::string split_spec;                 /* as given on the command line, for reports */
 };
 
 /* parameters handed to one algorithm variant */
@@ -896,6 +899,254 @@ inline std::vector<size_t> size_list(const Options& o, size_t elem)
     return counts;
 }
 
+/* ------------------------------------------------------------------------- */
+/* group layouts for --split-mask                                             */
+/* ------------------------------------------------------------------------- */
+/* Returns `slots`: a permutation of 0..N-1 such that group g consists of the
+ * ranks slots[g*M .. g*M+M-1]. The ranks are thought of as laid out in a line.
+ *
+ *  stride K : blocks of M*K consecutive ranks hold K interleaved groups whose
+ *             members are exactly K apart (requires N % (M*K) == 0).
+ *             K = 1 is consecutive ranks, K = N/M is rank % (N/M).
+ *  random p : start from the consecutive layout (rank r in group r/M) and
+ *             perform round(p*N/2) swaps. Each swap exchanges the groups of
+ *             two not-yet-moved ranks that belong to different groups and are
+ *             at most R = M * (N/M)^p apart on the line. Hence:
+ *               - about a fraction p of all ranks ends up outside its
+ *                 consecutive group (p = 0.5: a 50-50 chance per member);
+ *               - p -> 0: R ~ M, so a foreign member can only come from an
+ *                 adjoining group;
+ *               - p -> 1: R ~ N, every rank moves, distances are arbitrary.
+ *             Group sizes stay exactly M. */
+inline std::vector<int> group_layout(int N, int M, int K, double p, unsigned seed)
+{
+    std::vector<int> slots;
+    slots.reserve(N);
+    if (p < 0) {
+        const int block = M * K;
+        for (int b = 0; b < N / block; ++b)
+            for (int j = 0; j < K; ++j)
+                for (int i = 0; i < M; ++i) slots.push_back(b * block + j + i * K);
+        return slots;
+    }
+    const int G = N / M;
+    std::vector<int> grp(N);
+    for (int r = 0; r < N; ++r) grp[r] = r / M;
+    if (G > 1 && p > 0) {
+        std::mt19937_64 gen(seed);
+        const int R = (int)std::min<double>(N, std::ceil(M * std::pow((double)G, p)));
+        const long target = std::lround(p * N / 2.0);
+        std::vector<char> moved(N, 0);
+        std::vector<int> order(N);
+        for (int r = 0; r < N; ++r) order[r] = r;
+        std::shuffle(order.begin(), order.end(), gen);
+        /* pool of unmoved ranks with O(1) removal, for wide windows */
+        std::vector<int> pool(order), where(N);
+        for (int i = 0; i < N; ++i) where[pool[i]] = i;
+        auto unpool = [&](int r) {
+            int i = where[r], last = pool.back();
+            pool[i] = last;
+            where[last] = i;
+            pool.pop_back();
+        };
+        long done = 0;
+        std::vector<int> cand;
+        for (int r : order) {
+            if (done >= target) break;
+            if (moved[r]) continue;
+            const int lo = std::max(0, r - R), hi = std::min(N - 1, r + R);
+            auto ok = [&](int u) { return u >= lo && u <= hi && !moved[u] && grp[u] != grp[r]; };
+            /* cheap rejection sampling in the window first */
+            std::uniform_int_distribution<int> pick(lo, hi);
+            int u = -1;
+            for (int t = 0; t < 64 && u < 0; ++t) {
+                int c = pick(gen);
+                if (ok(c)) u = c;
+            }
+            if (u < 0 && hi - lo + 1 > 4096 && pool.size() > 1) {
+                /* wide, mostly used-up window: sample the unmoved ranks instead */
+                std::uniform_int_distribution<size_t> pp(0, pool.size() - 1);
+                for (int t = 0; t < 256 && u < 0; ++t) {
+                    int c = pool[pp(gen)];
+                    if (ok(c)) u = c;
+                }
+            }
+            if (u < 0) {
+                /* narrow window (cheap to scan), or nothing found by sampling */
+                cand.clear();
+                if (hi - lo + 1 <= 4096) {
+                    for (int c = lo; c <= hi; ++c)
+                        if (ok(c)) cand.push_back(c);
+                } else {
+                    for (int c : pool)
+                        if (ok(c)) cand.push_back(c);
+                }
+                if (cand.empty()) continue;
+                u = cand[std::uniform_int_distribution<size_t>(0, cand.size() - 1)(gen)];
+            }
+            std::swap(grp[r], grp[u]);
+            moved[r] = moved[u] = 1;
+            unpool(r);
+            unpool(u);
+            ++done;
+        }
+    }
+    /* bucket by group (O(N)); ranks stay in increasing order inside a group */
+    std::vector<int> fill(G, 0);
+    slots.assign(N, 0);
+    for (int r = 0; r < N; ++r) slots[(size_t)grp[r] * M + fill[grp[r]]++] = r;
+    return slots;
+}
+
+struct LayoutStats {
+    int non_consecutive = 0;   /* groups whose members are not M consecutive ranks */
+    double moved = 0;          /* fraction of ranks not in their default (consecutive) group */
+    double mean_gap = 0;       /* mean distance between neighbouring members (sorted) */
+    int max_span = 0;          /* largest (max - min) rank distance within a group */
+};
+
+inline LayoutStats layout_stats(const std::vector<int>& slots, int M)
+{
+    LayoutStats s;
+    const int N = (int)slots.size(), G = N / M;
+    double gaps = 0;
+    int moved = 0;
+    for (int g = 0; g < G; ++g) {
+        std::vector<int> mem(slots.begin() + (size_t)g * M, slots.begin() + (size_t)(g + 1) * M);
+        std::sort(mem.begin(), mem.end());
+        if (mem.back() - mem.front() != M - 1) ++s.non_consecutive;
+        s.max_span = std::max(s.max_span, mem.back() - mem.front());
+        for (int i = 1; i < M; ++i) gaps += mem[i] - mem[i - 1];
+        for (int r : mem) moved += (r / M != g);
+    }
+    s.mean_gap = M > 1 ? gaps / ((double)G * (M - 1)) : 0.0;
+    s.moved = (double)moved / N;
+    return s;
+}
+
+inline std::string group_members(const std::vector<int>& slots, int M, int g)
+{
+    std::vector<int> mem(slots.begin() + (size_t)g * M, slots.begin() + (size_t)(g + 1) * M);
+    std::sort(mem.begin(), mem.end());
+    std::string s = "{";
+    for (int i = 0; i < M; ++i) {
+        if (i) s += ",";
+        if (i == 6 && M > 8) { s += "...," + std::to_string(mem.back()); break; }
+        s += std::to_string(mem[i]);
+    }
+    return s + "}";
+}
+
+/* Node of every rank (collective over `world`), identified by host name
+ * (MPI_Get_processor_name). Host names are more reliable than
+ * MPI_COMM_TYPE_SHARED, which some MPI builds without shared memory report as
+ * one rank per node. Only a 64-bit hash of each name is gathered, so rank 0
+ * does not collect N full names at scale. Nodes are numbered 0.. in order of
+ * their lowest world rank. The result is only filled in on rank 0. */
+inline std::vector<int> node_map(MPI_Comm world)
+{
+    int rank, size;
+    MPI_Comm_rank(world, &rank);
+    MPI_Comm_size(world, &size);
+    char name[MPI_MAX_PROCESSOR_NAME];
+    int len = 0;
+    MPI_CHECK(MPI_Get_processor_name(name, &len));
+    uint64_t h = 1469598103934665603ull;  /* FNV-1a */
+    for (int i = 0; i < len; ++i) {
+        h ^= (unsigned char)name[i];
+        h *= 1099511628211ull;
+    }
+    unsigned long long hv = h;
+    std::vector<unsigned long long> hashes(rank == 0 ? size : 0);
+    MPI_CHECK(MPI_Gather(&hv, 1, MPI_UNSIGNED_LONG_LONG, hashes.data(), 1, MPI_UNSIGNED_LONG_LONG, 0, world));
+    std::vector<int> ids;
+    if (rank == 0) {
+        std::map<unsigned long long, int> index;
+        ids.resize(size);
+        for (int r = 0; r < size; ++r) {
+            auto it = index.find(hashes[r]);
+            if (it == index.end()) it = index.emplace(hashes[r], (int)index.size()).first;
+            ids[r] = it->second;
+        }
+    }
+    return ids;
+}
+
+/* "Group layout" block of the run header; printed with and without --split-mask */
+inline void print_layout(const Options& o, int size, int groups, int gsize, const std::vector<int>& slots,
+                         const std::vector<int>& node_of)
+{
+    /* how the groups were formed */
+    if (o.split_mask > 0) {
+        std::string how;
+        if (o.split_p >= 0) {
+            char b[96];
+            std::snprintf(b, sizeof b, "randomised members, p=%.3g (seed %u)", o.split_p, o.seed);
+            how = b;
+        } else if (o.split_stride == 1) {
+            how = "consecutive ranks";
+        } else {
+            how = "members " + std::to_string(o.split_stride) + " ranks apart";
+        }
+        std::printf("# groups       : %d concurrent communicators of %d ranks, %s (--split-mask %s)\n", groups,
+                    gsize, how.c_str(),
+                    o.split_spec.empty() ? std::to_string(o.split_mask).c_str() : o.split_spec.c_str());
+        LayoutStats ls = layout_stats(slots, gsize);
+        std::printf("# layout       : %d/%d groups non-consecutive, %.0f%% of ranks outside their "
+                    "consecutive group,\n#                mean member gap %.2f, max group span %d\n",
+                    ls.non_consecutive, groups, 100.0 * ls.moved, ls.mean_gap, ls.max_span);
+    } else {
+        std::printf("# groups       : 1 communicator of all %d ranks (MPI_COMM_WORLD; no --split-mask)\n", size);
+        std::printf("# layout       : ranks 0..%d, consecutive\n", size - 1);
+    }
+
+    /* how ranks and groups sit on nodes */
+    const int nnodes = node_of.empty() ? 1 : 1 + *std::max_element(node_of.begin(), node_of.end());
+    std::vector<int> per_node(nnodes, 0);
+    bool blocked = true;  /* node id non-decreasing along the rank line */
+    for (int r = 0; r < size; ++r) {
+        per_node[node_of[r]]++;
+        if (r > 0 && node_of[r] < node_of[r - 1]) blocked = false;
+    }
+    const int pmin = *std::min_element(per_node.begin(), per_node.end());
+    const int pmax = *std::max_element(per_node.begin(), per_node.end());
+    std::string ppn = pmin == pmax ? std::to_string(pmin) : std::to_string(pmin) + "-" + std::to_string(pmax);
+    std::printf("# nodes        : %d node%s, %s rank%s per node%s\n", nnodes, nnodes == 1 ? "" : "s", ppn.c_str(),
+                pmax == 1 ? "" : "s",
+                nnodes == 1 ? ""
+                            : (blocked ? ", block placement (consecutive ranks share a node)"
+                                       : ", non-block placement (e.g. round-robin over nodes)"));
+
+    auto nodes_in_group = [&](int g) {
+        std::vector<int> ns;
+        for (int i = 0; i < gsize; ++i) ns.push_back(node_of[slots[(size_t)g * gsize + i]]);
+        std::sort(ns.begin(), ns.end());
+        return (int)(std::unique(ns.begin(), ns.end()) - ns.begin());
+    };
+    if (groups > 1) {
+        int nmin = size, nmax = 0, intra = 0;
+        double nsum = 0;
+        for (int g = 0; g < groups; ++g) {
+            int k = nodes_in_group(g);
+            nmin = std::min(nmin, k);
+            nmax = std::max(nmax, k);
+            nsum += k;
+            intra += (k == 1);
+        }
+        std::printf("#                each group spans %d..%d node%s (mean %.2f); %d/%d groups are intra-node\n",
+                    nmin, nmax, nmax == 1 ? "" : "s", nsum / groups, intra, groups);
+    }
+
+    /* the first few groups explicitly */
+    const int show = std::min(groups, 4);
+    for (int g = 0; g < show; ++g) {
+        int k = nodes_in_group(g);
+        std::printf("#   group %-4d : %s  (%d node%s)\n", g, group_members(slots, gsize, g).c_str(), k,
+                    k == 1 ? "" : "s");
+    }
+    if (groups > show) std::printf("#   ... (%d more groups)\n", groups - show);
+}
+
 template <typename T>
 int run(MPI_Comm world, const Options& o, const std::string& type_name)
 {
@@ -903,18 +1154,41 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
     MPI_Comm_rank(world, &rank);
     MPI_Comm_size(world, &size);
 
-    /* --split-mask M: N/M groups of M consecutive ranks, each running its own
+    /* --split-mask M[:K|:p]: N/M groups of M ranks, each running its own
      * instance of the collective concurrently. Without it: one group = world. */
     int gsize = size, groups = 1;
     MPI_Comm comm = world;
+    std::vector<int> slots;  /* group layout, see group_layout() */
     if (o.split_mask > 0) {
+        const std::string spec = o.split_spec.empty() ? std::to_string(o.split_mask) : o.split_spec;
         if (o.split_mask > size || size % o.split_mask != 0)
-            throw std::invalid_argument("--split-mask " + std::to_string(o.split_mask) +
+            throw std::invalid_argument("--split-mask " + spec + ": M=" + std::to_string(o.split_mask) +
                                         " must divide the number of processes (" + std::to_string(size) + ")");
+        if (o.split_p < 0 && size % (o.split_mask * o.split_stride) != 0)
+            throw std::invalid_argument("--split-mask " + spec + ": groups of " + std::to_string(o.split_mask) +
+                                        " ranks spaced " + std::to_string(o.split_stride) +
+                                        " apart need N divisible by M*K = " +
+                                        std::to_string(o.split_mask * o.split_stride) + " (N = " +
+                                        std::to_string(size) + ")");
         gsize = o.split_mask;
         groups = size / gsize;
-        MPI_CHECK(MPI_Comm_split(world, rank / gsize, rank, &comm));
+        /* rank 0 builds the layout and broadcasts it, so that a randomised
+         * layout is identical everywhere whatever the RNG implementation */
+        slots.resize(size);
+        if (rank == 0) slots = group_layout(size, gsize, o.split_stride, o.split_p, o.seed);
+        MPI_CHECK(MPI_Bcast(slots.data(), size, MPI_INT, 0, world));
+        int color = -1;
+        for (int s = 0; s < size; ++s)
+            if (slots[s] == rank) color = s / gsize;
+        /* key = world rank: inside a group, ranks keep their order on the line */
+        MPI_CHECK(MPI_Comm_split(world, color, rank, &comm));
+    } else {
+        /* a single group: every rank, in order */
+        slots.resize(size);
+        for (int r = 0; r < size; ++r) slots[r] = r;
     }
+    /* which node every rank is on, for the layout report (rank 0 only) */
+    const std::vector<int> node_of = node_map(world);
     if (o.root < 0 || o.root >= gsize)
         throw std::invalid_argument("--root out of range (must be < " + std::to_string(gsize) +
                                     (o.split_mask > 0 ? ", the group size)" : ")"));
@@ -944,15 +1218,14 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             std::printf("# collage: point-to-point collective algorithm benchmark\n");
             std::printf("# MPI library  : %s\n", v.c_str());
             std::printf("# collective   : %s (%d ranks)\n", o.coll.c_str(), size);
-            if (o.split_mask > 0)
-                std::printf("# groups       : %d concurrent communicators of %d consecutive ranks (--split-mask %d)\n",
-                            groups, gsize, o.split_mask);
+            print_layout(o, size, groups, gsize, slots, node_of);
             std::printf("# size means   : %s\n", runner->size_semantics());
             std::printf("# datatype     : %s (%zu bytes)\n", type_name.c_str(), sizeof(T));
             if (runner->reduction())
                 std::printf("# operation    : %s (%s)\n", op.name.c_str(), op.commute ? "commutative" : "non-commutative");
             if (o.coll == "bcast" || o.coll == "reduce" || o.coll == "gather" || o.coll == "scatter")
-                std::printf("# root         : %d%s\n", o.root, o.split_mask > 0 ? " (rank within each group)" : "");
+                std::printf("# root         : %d%s\n", o.root,
+                            o.split_mask > 0 ? " (rank within each group; groups are ordered by world rank)" : "");
             if (o.coll == "alltoallv" || o.coll == "allgatherv" || o.coll == "reduce_scatter")
                 std::printf("# distribution : %s (seed %u)\n", o.vdist.c_str(), o.seed);
             std::printf("# iterations   : %d (warmup %d), %d (warmup %d) above %s\n", o.iters, o.warmup,
@@ -1129,11 +1402,20 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
         }
 
         if (rank == 0 && !o.csv.empty()) {
+            /* layout tag: "-" (no split), "consecutive", "stride=K" or "random:p=P" */
+            std::string layout = "-";
+            if (o.split_mask > 0) {
+                char lb[64];
+                if (o.split_p >= 0) std::snprintf(lb, sizeof lb, "random:p=%g:seed=%u", o.split_p, o.seed);
+                else if (o.split_stride == 1) std::snprintf(lb, sizeof lb, "consecutive");
+                else std::snprintf(lb, sizeof lb, "stride=%d", o.split_stride);
+                layout = lb;
+            }
             FILE* f = std::fopen(o.csv.c_str(), "w");
             if (!f) {
                 std::fprintf(stderr, "cannot open %s for writing\n", o.csv.c_str());
             } else {
-                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,groups,group_ranks,root,bytes,count,"
+                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,groups,group_ranks,layout,root,bytes,count,"
                                 "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
@@ -1146,10 +1428,10 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                         if ((c.state == Cell::Ok || c.state == Cell::Fail) && c.avg > 0) bw = pb / c.avg;  /* B/us == MB/s */
                         std::string note = c.note;
                         std::replace(note.begin(), note.end(), ',', ';');
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s\n",
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s\n",
                                      o.coll.c_str(), variants[vi].base.c_str(), variants[vi].label.c_str(),
                                      type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, groups,
-                                     gsize, o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw,
+                                     gsize, layout.c_str(), o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw,
                                      c.aggbw, note.c_str());
                     }
                 std::fclose(f);

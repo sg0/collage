@@ -90,7 +90,7 @@ void usage()
         "  -f, --factor F         geometric step (default 2)\n"
         "      --sizes LIST       explicit list, e.g. 0,8,1K,64K,4M (overrides -m/-M/-f)\n"
         "      --vdist D          v-collectives: uniform | random | linear (default uniform)\n"
-        "      --seed N           seed for --vdist random (default 42)\n"
+        "      --seed N           seed for --vdist random and --split-mask M:p (default 42)\n"
         "\n"
         "algorithm tunables (comma lists are swept, producing one column each)\n"
         "  -r, --root R           root of rooted collectives (default 0)\n"
@@ -101,11 +101,18 @@ void usage()
         "      --first-seg LIST   gather linear_sync first segment bytes (default 1K)\n"
         "\n"
         "concurrent groups\n"
-        "      --split-mask M     split the N processes into N/M communicators of M\n"
-        "                         consecutive ranks and run every algorithm on all of\n"
-        "                         them at the same time (M must divide N; --root is\n"
-        "                         the rank within a group). Reports the mean latency\n"
-        "                         over groups and the aggregate bandwidth.\n"
+        "      --split-mask M[:K|:p]\n"
+        "                         split the N processes into N/M communicators of M\n"
+        "                         ranks and run every algorithm on all of them at the\n"
+        "                         same time (M must divide N; --root is the rank within\n"
+        "                         a group). Reports the mean latency over groups and\n"
+        "                         the aggregate bandwidth. Group members are:\n"
+        "                           M     consecutive ranks\n"
+        "                           M:K   exactly K ranks apart (N divisible by M*K)\n"
+        "                           M:p   random, p in [0,1] written with a decimal\n"
+        "                                 point (8:0.45, 8:1.0); low p keeps groups\n"
+        "                                 nearly consecutive, high p scatters them.\n"
+        "                                 Uses --seed.\n"
         "\n"
         "measurement\n"
         "  -i, --iters N          timed iterations (default 100)\n"
@@ -118,6 +125,51 @@ void usage()
         "      --check-only       verify, do not time\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
         "  -q, --quiet            no table on stdout\n");
+}
+
+/* --split-mask M        groups of M consecutive ranks
+ * --split-mask M:K      groups of M ranks spaced exactly K apart (K integer >= 1)
+ * --split-mask M:p      groups of M ranks, randomised with probability p in [0,1];
+ *                       p is recognised by its decimal point (8:1 is stride 1,
+ *                       8:1.0 is p = 1) */
+void parse_split(const std::string& spec, Options& o)
+{
+    const std::string err = "bad --split-mask '" + spec + "' (expected M, M:K or M:p, e.g. 8, 8:4, 8:0.45)";
+    auto whole = [&](const std::string& t, size_t& pos) {
+        if (t.empty()) throw std::invalid_argument(err);
+        double d = std::stod(t, &pos);
+        if (pos != t.size()) throw std::invalid_argument(err);
+        return d;
+    };
+    size_t colon = spec.find(':');
+    std::string ms = spec.substr(0, colon);
+    size_t pos = 0;
+    try {
+        if (ms.empty() || ms.find_first_not_of("0123456789") != std::string::npos) throw std::invalid_argument(err);
+        o.split_mask = std::stoi(ms);
+        o.split_stride = 1;
+        o.split_p = -1.0;
+        if (colon != std::string::npos) {
+            std::string rest = spec.substr(colon + 1);
+            if (rest.find_first_of(".eE") != std::string::npos) {
+                double p = whole(rest, pos);
+                if (!(p >= 0.0 && p <= 1.0))
+                    throw std::invalid_argument("--split-mask '" + spec + "': p must be in [0, 1]");
+                o.split_p = p;
+            } else {
+                if (rest.empty() || rest.find_first_not_of("0123456789") != std::string::npos)
+                    throw std::invalid_argument(err);
+                o.split_stride = std::stoi(rest);
+                if (o.split_stride < 1)
+                    throw std::invalid_argument("--split-mask '" + spec + "': stride K must be >= 1");
+            }
+        }
+    } catch (const std::invalid_argument&) {
+        throw;
+    } catch (const std::exception&) {
+        throw std::invalid_argument(err);
+    }
+    o.split_spec = spec;
 }
 
 Options parse(int argc, char** argv, bool& list, bool& help)
@@ -169,7 +221,7 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--check-only") o.check_only = true;
         else if (a == "--csv") o.csv = v();
         else if (a == "-q" || a == "--quiet") o.quiet = true;
-        else if (a == "--split-mask" || a == "-split-mask") o.split_mask = std::stoi(v());
+        else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
         else throw std::invalid_argument("unknown option '" + a + "' (see --help)");
     }
