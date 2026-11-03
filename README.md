@@ -10,6 +10,9 @@ the native MPI collective.
 
 The algorithm set is the one in the original headers. No algorithms were added.
 
+I would like to acknowledge the implicit generosity and dedication of the MPI implementers, 
+researchers, and, broadly the MPI Forum for continuing to steer HPC ahead.
+
 ## Layout
 
 | file | contents |
