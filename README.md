@@ -176,17 +176,6 @@ Without the option, the report describes a single group of all N ranks on
 #   ...
 ```
 
-The report contains:
-
-* how the groups were formed;
-* how far the layout is from consecutive: the number of non-consecutive
-  groups, the fraction of ranks outside their consecutive group, the mean gap
-  between neighbouring members and the largest group span;
-* how the ranks sit on nodes: the node count, ranks per node, and whether
-  the launcher placed ranks in blocks or round-robin;
-* how many nodes each group spans, and how many groups stay inside one node;
-* the first four groups' members, each with its node count.
-
 Nodes are identified by host name (`MPI_Get_processor_name`). The report shows
 how a given layout interacts with the launcher's placement. For example,
 `8:4` spreads every group over 4 nodes with block placement, but keeps each
@@ -258,9 +247,7 @@ recursive-doubling allgather becomes `k_bruck(2)` on non-power-of-two sizes,
 neighbor exchange becomes `ring` on odd sizes, and `scatter_allgather` becomes
 `linear` when `count < size`.
 
-**Composite algorithms.** Upstream, these call "whatever collective is
-selected on the communicator". Here they are wired to fixed point-to-point
-sub-algorithms, so nothing reaches the MPI library's collectives:
+**Composite algorithms.** 
 
 | algorithm | sub-steps used here |
 |---|---|
@@ -276,15 +263,12 @@ To use different sub-steps, change the corresponding line in the header.
 ## Verification
 
 `--check` runs the native MPI collective once per size to build the
-reference. It then re-initialises the inputs, runs each algorithm once on
+reference. It then re-initializes the inputs, runs each algorithm once on
 poisoned output buffers, and compares the result element by element. The
 comparison covers the root for rooted collectives and every rank otherwise.
 Inputs are small integers chosen per operation, so floating-point sums and
-products are exact whatever the reduction order.
-
-The full matrix was run with MPICH 4.2.3 and passed. It covered 1–8 ranks, all
-collectives and algorithms, all operations, several types, roots, segment
-sizes, radices, request limits and count distributions.
+products are exact whatever the reduction order. Verification study is 
+currently ongoing, please file bugs.
 
 ## License
 
