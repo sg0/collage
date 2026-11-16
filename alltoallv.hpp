@@ -32,7 +32,7 @@ public:
         }
         if ((1 == size) || (0 == max_size)) return;
 
-        std::vector<T> tmp_buffer(max_size);
+        Buf<T> tmp_buffer(max_size);
 
         for (i = 1; i <= (size >> 1); ++i) {
             right = (rank + i) % size;

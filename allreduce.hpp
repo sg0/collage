@@ -41,7 +41,7 @@ public:
             return;
         }
 
-        std::vector<T> inplacebuf(count);
+        Buf<T> inplacebuf(count);
         copy_elems(inplacebuf.data(), sbuf, count);
         T* tmpsend = inplacebuf.data();
         T* tmprecv = rbuf;
@@ -117,7 +117,7 @@ public:
         compute_blockcount(count, size, split_rank, early_segcount, late_segcount);
         max_segcount = early_segcount;
 
-        std::vector<T> inbuf_v[2];
+        Buf<T> inbuf_v[2];
         T* inbuf[2] = {nullptr, nullptr};
         inbuf_v[0].resize(max_segcount);
         inbuf[0] = inbuf_v[0].data();
@@ -205,7 +205,7 @@ public:
         compute_blockcount(count, size, split_rank, early_blockcount, late_blockcount);
         compute_blockcount(early_blockcount, num_phases, tmp1, max_segcount, tmp2);
 
-        std::vector<T> inbuf_v[2];
+        Buf<T> inbuf_v[2];
         T* inbuf[2] = {nullptr, nullptr};
         inbuf_v[0].resize(max_segcount);
         inbuf[0] = inbuf_v[0].data();
@@ -295,7 +295,7 @@ public:
         if (-1 == nsteps) throw std::runtime_error("redscat_allgather: bad communicator size");
         int nprocs_pof2 = 1 << nsteps;
 
-        std::vector<T> tmp_buf(count);
+        Buf<T> tmp_buf(count);
         copy_elems(rbuf, sbuf, count);
 
         int vrank, step;
@@ -376,7 +376,7 @@ public:
     {
         require_commutative(op, "allgather_reduce");
         const int size = size_;
-        std::vector<T> partial_buf(count * (size_t)size), tmpsend(count);
+        Buf<T> partial_buf(count * (size_t)size), tmpsend(count);
         copy_elems(tmpsend.data(), sbuf, count);
 
         allgather_.recursivedoubling(tmpsend.data(), count, partial_buf.data(), count);

@@ -186,7 +186,7 @@ public:
         int dst, src, recvcount, distance;
         const int size = size_, rank = rank_;
         int num_reqs, max_reqs = 0;
-        std::vector<T> tmp_buf;
+        Buf<T> tmp_buf;
 
         if (radix < 2) throw std::invalid_argument("k_bruck: radix must be >= 2");
 

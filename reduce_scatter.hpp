@@ -30,7 +30,7 @@ public:
         size_t total_count = 0;
         for (int i = 0; i < size; i++) total_count += rcounts[i];
 
-        std::vector<T> tmprbuf_free;
+        Buf<T> tmprbuf_free;
         T* tmprbuf = rbuf;
         if (root == rank) {
             /* temporary receive buffer on root: rbuf only holds rcounts[root] */
@@ -65,7 +65,7 @@ public:
         /* short cut the trivial case */
         if (0 == count) return;
 
-        std::vector<T> recv_buf(count), result_buf(count);
+        Buf<T> recv_buf(count), result_buf(count);
         copy_elems(result_buf.data(), sbuf, count);
 
         tmp_size = next_poweroftwo(size);
@@ -172,7 +172,7 @@ public:
         }
         require_commutative(op, "ring");
 
-        std::vector<T> accumbuf(total_count), inbuf_v[2];
+        Buf<T> accumbuf(total_count), inbuf_v[2];
         T* inbuf[2] = {nullptr, nullptr};
         inbuf_v[0].resize(max_block_count);
         inbuf[0] = inbuf_v[0].data();
@@ -220,7 +220,7 @@ public:
         for (int i = 1; i < comm_size; i++) displs[i] = displs[i - 1] + rcounts[i - 1];
         size_t totalcount = displs[comm_size - 1] + rcounts[comm_size - 1];
 
-        std::vector<T> tmpbuf0(std::max<size_t>(totalcount, 1)), tmpbuf1(std::max<size_t>(totalcount, 1));
+        Buf<T> tmpbuf0(std::max<size_t>(totalcount, 1)), tmpbuf1(std::max<size_t>(totalcount, 1));
         T* psend = tmpbuf0.data();
         T* precv = tmpbuf1.data();
         copy_elems(psend, sbuf, totalcount);

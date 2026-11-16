@@ -124,7 +124,17 @@ void usage()
         "      --check            verify every algorithm against the native MPI collective\n"
         "      --check-only       verify, do not time\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
-        "  -q, --quiet            no table on stdout\n");
+        "  -q, --quiet            no table on stdout\n"
+        "\n"
+        "GPU buffers (needs a CUDA-aware MPI and a build with `make CUDA=1`)\n"
+        "      --gpu              user buffers and all algorithm temporaries in GPU\n"
+        "                         memory; one GPU per process (local rank %% visible GPUs)\n"
+        "      --gpu-reduce MODE  local reductions on GPU data: kernel (CUDA kernels,\n"
+        "                         default) | mpi (MPI_Reduce_local on device pointers)\n"
+        "                         | host (staged through pinned host memory).\n"
+        "                         User-defined ops (-o user, user_nc) always use host.\n"
+        "      --assume-cuda-aware  run even if the MPI library does not report CUDA\n"
+        "                         awareness (for libraries that cannot be queried)\n");
 }
 
 /* --split-mask M        groups of M consecutive ranks
@@ -219,6 +229,13 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--max-mem") o.max_mem = parse_bytes(v());
         else if (a == "--check") o.check = true;
         else if (a == "--check-only") o.check_only = true;
+        else if (a == "--gpu") o.gpu = true;
+        else if (a == "--gpu-reduce") {
+            o.gpu_reduce = v();
+            if (o.gpu_reduce != "kernel" && o.gpu_reduce != "mpi" && o.gpu_reduce != "host")
+                throw std::invalid_argument("--gpu-reduce must be kernel, mpi or host");
+        }
+        else if (a == "--assume-cuda-aware") o.assume_cuda_aware = true;
         else if (a == "--csv") o.csv = v();
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
@@ -283,8 +300,109 @@ void list_algorithms(const Options& o, int rank)
 
 }  // namespace
 
+/* ---- GPU setup ---------------------------------------------------------- */
+#if defined(COLLAGE_CUDA) && defined(OPEN_MPI) && defined(__has_include)
+#if __has_include(<mpi-ext.h>)
+#include <mpi-ext.h> /* MPIX_CUDA_AWARE_SUPPORT, MPIX_Query_cuda_support */
+#endif
+#endif
+
+/* does the MPI library say it can take device pointers? 1 yes, 0 no, -1 unknown */
+int cuda_aware(std::string& how)
+{
+#if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+    how = "Open MPI, MPIX_Query_cuda_support()";
+    return MPIX_Query_cuda_support() ? 1 : 0;
+#elif defined(MPIX_CUDA_AWARE_SUPPORT)
+    how = "Open MPI, built without CUDA support";
+    return 0;
+#elif defined(MPIX_GPU_SUPPORT_CUDA)
+    int ok = 0;
+    how = "MPIX_GPU_query_support(MPIX_GPU_SUPPORT_CUDA)";
+    if (MPIX_GPU_query_support(MPIX_GPU_SUPPORT_CUDA, &ok) != MPI_SUCCESS) return -1;
+    return ok ? 1 : 0;
+#else
+    how = "the library offers no query";
+    return -1;
+#endif
+}
+
+/* node-local rank from the launcher's environment, before MPI_Init */
+int env_local_rank(std::string& from)
+{
+    const char* vars[] = {"OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID",
+                          "PMI_LOCAL_RANK", "PALS_LOCAL_RANKID", "SLURM_LOCALID", "FLUX_TASK_LOCAL_ID"};
+    for (const char* v : vars)
+        if (const char* e = std::getenv(v)) {
+            from = v;
+            return std::atoi(e);
+        }
+    return -1;
+}
+
+bool argv_has(int argc, char** argv, const char* opt)
+{
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], opt) == 0) return true;
+    return false;
+}
+
+#if defined(COLLAGE_CUDA)
+/* select the GPU (if not done before MPI_Init), check CUDA awareness,
+ * configure the memory layer and prepare the header lines */
+void setup_gpu(Options& o, int pre_local, const std::string& pre_from, int rank)
+{
+    int local = pre_local;
+    std::string from = pre_from;
+    if (local < 0) {
+        MPI_Comm node;
+        MPI_CHECK(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node));
+        MPI_Comm_rank(node, &local);
+        MPI_Comm_free(&node);
+        from = "MPI_COMM_TYPE_SHARED, after MPI_Init";
+        mem::select_device(local);
+    }
+    std::string how;
+    int aware = cuda_aware(how);
+    /* every rank must take the same decision */
+    int all = aware, any_no = (aware == 0);
+    MPI_Allreduce(MPI_IN_PLACE, &any_no, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &all, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (any_no && !o.assume_cuda_aware)
+        throw std::runtime_error("--gpu: the MPI library reports that it is not CUDA-aware (" + how +
+                                 "); device buffers would crash it. Use a CUDA-aware build, or pass "
+                                 "--assume-cuda-aware if you know better.");
+    mem::configure(mem::Space::Device, o.gpu_reduce == "kernel" ? mem::ReduceMode::Kernel
+                                       : o.gpu_reduce == "mpi"  ? mem::ReduceMode::Mpi
+                                                                : mem::ReduceMode::Host);
+    /* how many distinct GPUs are in use per node (for the header) */
+    int ndev = mem::device_count();
+    o.gpu_report.push_back("# buffers      : GPU memory (CUDA), one device per process");
+    o.gpu_report.push_back("#                rank 0 on " + mem::device_name());
+    o.gpu_report.push_back("#                device = local rank % " + std::to_string(ndev) +
+                           " visible device(s); local rank from " + from);
+    std::string verdict = all == 1 ? "yes" : any_no ? "NO (overridden by --assume-cuda-aware)" : "unknown";
+    o.gpu_report.push_back("# CUDA-aware   : " + verdict + " (" + how + ")");
+    if (all == -1 && !any_no && rank == 0)
+        std::fprintf(stderr, "collage: warning: cannot tell whether the MPI library is CUDA-aware (%s); "
+                             "continuing with device buffers\n", how.c_str());
+}
+#endif
+
 int main(int argc, char** argv)
 {
+    /* With --gpu, pick the device before MPI_Init when the launcher tells us the
+     * local rank: several CUDA-aware MPIs set up their CUDA context in MPI_Init. */
+    const bool want_gpu = argv_has(argc, argv, "--gpu");
+    (void)want_gpu;
+    std::string pre_from;
+    int pre_local = -1;
+#if defined(COLLAGE_CUDA)
+    if (want_gpu) {
+        pre_local = env_local_rank(pre_from);
+        if (pre_local >= 0) mem::select_device(pre_local);
+    }
+#endif
     MPI_Init(&argc, &argv);
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -292,6 +410,14 @@ int main(int argc, char** argv)
     try {
         bool list = false, help = false;
         Options o = parse(argc, argv, list, help);
+        if (o.gpu && !help && !list) {
+#if defined(COLLAGE_CUDA)
+            setup_gpu(o, pre_local, pre_from, rank);
+#else
+            (void)pre_local;
+            throw std::invalid_argument("--gpu: this binary was built without CUDA support (rebuild with `make CUDA=1`)");
+#endif
+        }
         if (help) {
             if (rank == 0) usage();
         } else if (list) {
@@ -304,6 +430,7 @@ int main(int argc, char** argv)
         if (rank == 0) std::fprintf(stderr, "collage: %s\n", e.what());
         rc = 1;
     }
+    mem::shutdown(); /* cached device memory, staging buffers, stream */
     MPI_Finalize();
     return rc;
 }

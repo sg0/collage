@@ -21,7 +21,7 @@ public:
         const int size = size_, rank = rank_;
         size_t curr_count;
         T* ptmp;
-        std::vector<T> tempbuf;
+        Buf<T> tempbuf;
         MPI_Status status;
 
         Tree bmtree = topo::build_in_order_bmtree(rank, size, root);

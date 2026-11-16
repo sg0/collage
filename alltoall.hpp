@@ -24,7 +24,7 @@ public:
 
         if ((1 == size) || (0 == rcount)) return;
 
-        std::vector<T> tmp_buffer(rcount);
+        Buf<T> tmp_buffer(rcount);
 
         for (i = 1; i <= (size >> 1); ++i) {
             right = (rank + i) % size;
@@ -73,7 +73,7 @@ public:
         int i, sendto, recvfrom, distance;
         const int size = size_, rank = rank_;
 
-        std::vector<T> tmpbuf((size_t)size * rcount);
+        Buf<T> tmpbuf((size_t)size * rcount);
 
         /* Step 1 - local rotation - shift up by rank */
         copy_elems(tmpbuf.data(), sbuf + (size_t)rank * scount, (size_t)(size - rank) * scount);

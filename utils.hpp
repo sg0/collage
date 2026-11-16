@@ -28,6 +28,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "memory.hpp"
 #include <type_traits>
 
 #if defined(MPI_VERSION) && (MPI_VERSION >= 4) && !defined(COLLAGE_NO_LARGE_COUNT)
@@ -704,7 +706,7 @@ protected:
             int tsize = 0;
             MPI_Type_size(sdt, &tsize);
             size_t n = std::min(scount, rcount) * (size_t)tsize;
-            if (n && sbuf != rbuf) std::memmove(rbuf, sbuf, n);
+            if (n && sbuf != rbuf) mem::copy(rbuf, sbuf, n);  /* host or device */
             return;
         }
         sendrecv_actual(sbuf, scount, sdt, dest, stag, rbuf, rcount, rdt, source, rtag, st);
@@ -719,27 +721,12 @@ protected:
         wait(&req);
     }
 
-    /* ompi_op_reduce: target = source (op) target */
+    /* ompi_op_reduce: target = source (op) target, in the current memory
+     * space (MPI_Reduce_local on the host; kernel / MPI / staged on a GPU) */
     static void reduce_local(const void* source, void* target, size_t count, MPI_Datatype dt,
                              MPI_Op op)
     {
-        if (0 == count) return;
-#if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Reduce_local_c(source, target, (MPI_Count)count, dt, op));
-#else
-        /* chunk to stay below INT_MAX */
-        int tsize = 0;
-        MPI_Type_size(dt, &tsize);
-        const char* s = static_cast<const char*>(source);
-        char* t = static_cast<char*>(target);
-        while (count > 0) {
-            int c = (int)std::min(count, (size_t)INT_MAX);
-            MPI_CHECK(MPI_Reduce_local(s, t, c, dt, op));
-            s += (size_t)c * tsize;
-            t += (size_t)c * tsize;
-            count -= c;
-        }
-#endif
+        mem::reduce(source, target, count, dt, op);
     }
 
     /* ompi_3buff_op_reduce: target = source1 (op) source2 */
@@ -749,16 +736,17 @@ protected:
         if (0 == count) return;
         int tsize = 0;
         MPI_Type_size(dt, &tsize);
-        if (target != source2) std::memcpy(target, source2, count * (size_t)tsize);
+        if (target != source2) mem::copy(target, source2, count * (size_t)tsize);
         reduce_local(source1, target, count, dt, op);
     }
 };
 
-/* local typed copy (ompi_datatype_copy_content_same_ddt / ompi_datatype_sndrcv) */
+/* local typed copy (ompi_datatype_copy_content_same_ddt / ompi_datatype_sndrcv),
+ * memmove semantics, in the current memory space */
 template <typename T>
 inline void copy_elems(T* dst, const T* src, size_t count)
 {
-    if (count && dst != src) std::memmove(dst, src, count * sizeof(T));
+    if (count && dst != src) mem::copy(dst, src, count * sizeof(T));
 }
 
 #endif /* COLLAGE_UTILS_HPP */

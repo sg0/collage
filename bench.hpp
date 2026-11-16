@@ -72,6 +72,10 @@ struct Options {
     int split_stride = 1;                   /* M:K  -> members exactly K ranks apart */
     double split_p = -1.0;                  /* M:p  -> randomised layout, p in [0,1] (<0: off) */
     std::string split_spec;                 /* as given on the command line, for reports */
+    bool gpu = false;                       /* --gpu: user buffers and temporaries in GPU memory */
+    std::string gpu_reduce = "kernel";      /* kernel | mpi | host (local reductions on GPU data) */
+    bool assume_cuda_aware = false;         /* skip the library's CUDA-awareness answer */
+    std::vector<std::string> gpu_report;    /* header lines prepared by the driver */
 };
 
 /* parameters handed to one algorithm variant */
@@ -224,14 +228,40 @@ public:
     /* the part of the output that is defined on this rank */
     virtual std::pair<const T*, size_t> result() const = 0;
 
+    /* Buffers live on the host (sbuf_/rbuf_), where they are generated and
+     * checked. With --gpu they are mirrored on the device (dsbuf_/drbuf_):
+     * upload() after (re)initialising, download() before reading results.
+     * Algorithms and native() only ever see S() and R(). */
+    void upload()
+    {
+        if (!mem::device()) return;
+        dsbuf_.resize(sbuf_.size());
+        drbuf_.resize(rbuf_.size());
+        mem::upload(dsbuf_.data(), sbuf_.data(), sbuf_.size() * sizeof(T));
+        mem::upload(drbuf_.data(), rbuf_.data(), rbuf_.size() * sizeof(T));
+    }
+    void download()
+    {
+        if (!mem::device()) return;
+        mem::download(rbuf_.data(), drbuf_.data(), rbuf_.size() * sizeof(T));
+    }
+    /* prepare + upload: buffers ready for a run of `algo` */
+    void stage(const std::string& algo)
+    {
+        prepare(algo);
+        upload();
+    }
+
     void snapshot()
     {
+        download();
         auto r = result();
         expected_.assign(r.first, r.first + r.second);
     }
     /* returns the number of mismatching elements on this rank */
-    size_t compare() const
+    size_t compare()
     {
+        download();
         auto r = result();
         if (r.second != expected_.size()) return std::max(r.second, expected_.size());
         size_t bad = 0;
@@ -247,7 +277,12 @@ protected:
     MPI_Datatype dt_;
     int rank_ = 0, size_ = 1;
     size_t count_ = 0;
-    std::vector<T> sbuf_, rbuf_, expected_;
+    std::vector<T> sbuf_, rbuf_, expected_;  /* host: generation and checking */
+    Buf<T> dsbuf_, drbuf_;                   /* device mirrors (--gpu) */
+
+    /* the buffers handed to algorithms and to the native collective */
+    T* S() { return mem::device() ? dsbuf_.data() : sbuf_.data(); }
+    T* R() { return mem::device() ? drbuf_.data() : rbuf_.data(); }
 
     Fill fill() const { return reduction() ? fill_for(op_) : Fill::Data; }
     void fill_input(std::vector<T>& v, size_t n, size_t offset = 0)
@@ -298,12 +333,12 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Bcast)(this->rbuf_.data(), ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
+        MPI_CHECK(NATIVE(MPI_Bcast)(this->R(), ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto buf = [this]() { return this->rbuf_.data(); };
+        auto buf = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         return {
             {"bintree", P_SEG, [=](const AlgoParams& p) { c_.bintree(buf(), n(), p.root, p.segsize); }, {}},
@@ -336,7 +371,7 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Reduce)(this->sbuf_.data(), this->rbuf_.data(), ncnt(this->count_), this->dt_,
+        MPI_CHECK(NATIVE(MPI_Reduce)(this->S(), this->R(), ncnt(this->count_), this->dt_,
                                      this->op_.op, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override
@@ -346,8 +381,8 @@ public:
     }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         const int P = this->size_;
         return {
@@ -381,14 +416,14 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Allreduce)(this->sbuf_.data(), this->rbuf_.data(), ncnt(this->count_), this->dt_,
+        MPI_CHECK(NATIVE(MPI_Allreduce)(this->S(), this->R(), ncnt(this->count_), this->dt_,
                                         this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         const size_t P = (size_t)this->size_;
         return {
@@ -421,14 +456,14 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Allgather)(this->sbuf_.data(), ncnt(this->count_), this->dt_, this->rbuf_.data(),
+        MPI_CHECK(NATIVE(MPI_Allgather)(this->S(), ncnt(this->count_), this->dt_, this->R(),
                                         ncnt(this->count_), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_ * this->size_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         return {
             {"recursivedoubling", 0, [=](const AlgoParams&) { c_.recursivedoubling(s(), n(), r(), n()); }, {}},
@@ -473,14 +508,14 @@ public:
     {
         auto rc = to_ncounts(rcounts_);
         auto rd = to_ndispls(rdispls_);
-        MPI_CHECK(NATIVE(MPI_Allgatherv)(this->sbuf_.data(), ncnt(scount_), this->dt_, this->rbuf_.data(), rc.data(),
+        MPI_CHECK(NATIVE(MPI_Allgatherv)(this->S(), ncnt(scount_), this->dt_, this->R(), rc.data(),
                                          rd.data(), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), total_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         return {
             {"bruck", 0, [=](const AlgoParams&) { c_.bruck(s(), scount_, r(), rcounts_, rdispls_); }, {}},
             {"sparbit", 0, [=](const AlgoParams&) { c_.sparbit(s(), scount_, r(), rcounts_, rdispls_); }, {}},
@@ -518,14 +553,14 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Alltoall)(this->sbuf_.data(), ncnt(this->count_), this->dt_, this->rbuf_.data(),
+        MPI_CHECK(NATIVE(MPI_Alltoall)(this->S(), ncnt(this->count_), this->dt_, this->R(),
                                        ncnt(this->count_), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_ * this->size_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         const size_t P = (size_t)this->size_;
         return {
@@ -582,14 +617,14 @@ public:
     {
         auto sc = to_ncounts(scounts_), rc = to_ncounts(rcounts_);
         auto sd = to_ndispls(sdispls_), rd = to_ndispls(rdispls_);
-        MPI_CHECK(NATIVE(MPI_Alltoallv)(this->sbuf_.data(), sc.data(), sd.data(), this->dt_, this->rbuf_.data(),
+        MPI_CHECK(NATIVE(MPI_Alltoallv)(this->S(), sc.data(), sd.data(), this->dt_, this->R(),
                                         rc.data(), rd.data(), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), rtotal_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         return {
             {"inplace", 0, [=](const AlgoParams&) {
                  if (this->opt_.vdist != "uniform" && this->count_ > 0)
@@ -619,7 +654,7 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Gather)(this->sbuf_.data(), ncnt(this->count_), this->dt_, this->rbuf_.data(),
+        MPI_CHECK(NATIVE(MPI_Gather)(this->S(), ncnt(this->count_), this->dt_, this->R(),
                                      ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override
@@ -629,8 +664,8 @@ public:
     }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         return {
             {"binomial", 0, [=](const AlgoParams& p) { c_.binomial(s(), n(), r(), n(), p.root); }, {}},
@@ -658,14 +693,14 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Scatter)(this->sbuf_.data(), ncnt(this->count_), this->dt_, this->rbuf_.data(),
+        MPI_CHECK(NATIVE(MPI_Scatter)(this->S(), ncnt(this->count_), this->dt_, this->R(),
                                       ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         return {
             {"binomial", 0, [=](const AlgoParams& p) { c_.binomial(s(), n(), r(), n(), p.root); }, {}},
@@ -726,14 +761,14 @@ public:
     void native() override
     {
         auto rc = to_ncounts(rcounts_);
-        MPI_CHECK(NATIVE(MPI_Reduce_scatter)(this->sbuf_.data(), this->rbuf_.data(), rc.data(), this->dt_,
+        MPI_CHECK(NATIVE(MPI_Reduce_scatter)(this->S(), this->R(), rc.data(), this->dt_,
                                              this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), rcounts_[this->rank_]}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         return {
             {"nonoverlapping", P_SEG | P_MAXREQ, [=](const AlgoParams& p) { c_.nonoverlapping(s(), r(), rcounts_, p.op, p.segsize, p.max_reqs); }, {}},
             {"recursivehalving", 0, [=](const AlgoParams& p) { c_.recursivehalving(s(), r(), rcounts_, p.op); }, {}},
@@ -761,14 +796,14 @@ public:
     }
     void native() override
     {
-        MPI_CHECK(NATIVE(MPI_Reduce_scatter_block)(this->sbuf_.data(), this->rbuf_.data(), ncnt(this->count_),
+        MPI_CHECK(NATIVE(MPI_Reduce_scatter_block)(this->S(), this->R(), ncnt(this->count_),
                                                    this->dt_, this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
     std::vector<AlgoDef> algorithms() override
     {
-        auto s = [this]() { return (const T*)this->sbuf_.data(); };
-        auto r = [this]() { return this->rbuf_.data(); };
+        auto s = [this]() { return (const T*)this->S(); };
+        auto r = [this]() { return this->R(); };
         auto n = [this]() { return this->count_; };
         return {
             {"basic_linear", 0, [=](const AlgoParams& p) { c_.basic_linear(s(), r(), n(), p.op); }, {}},
@@ -1221,6 +1256,19 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             print_layout(o, size, groups, gsize, slots, node_of);
             std::printf("# size means   : %s\n", runner->size_semantics());
             std::printf("# datatype     : %s (%zu bytes)\n", type_name.c_str(), sizeof(T));
+            if (o.gpu) {
+                for (auto& l : o.gpu_report) std::printf("%s\n", l.c_str());
+                if (runner->reduction())
+                    std::printf("# gpu reduce   : %s%s\n", o.gpu_reduce.c_str(),
+                                o.gpu_reduce == "kernel" ? " (CUDA kernels for predefined ops)"
+                                : o.gpu_reduce == "mpi" ? " (MPI_Reduce_local on device pointers)"
+                                                        : " (staged through pinned host memory)");
+                if (runner->reduction() && op.user)
+                    std::printf("#                user-defined op '%s': reduced on the host (staged)\n",
+                                op.name.c_str());
+            } else {
+                std::printf("# buffers      : host memory\n");
+            }
             if (runner->reduction())
                 std::printf("# operation    : %s (%s)\n", op.name.c_str(), op.commute ? "commutative" : "non-commutative");
             if (o.coll == "bcast" || o.coll == "reduce" || o.coll == "gather" || o.coll == "scatter")
@@ -1251,7 +1299,10 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             const int warm = large ? o.warmup_large : o.warmup;
 
             bool fits = runner->mem_bytes(n) <= o.max_mem;
-            if (fits) runner->setup(n);
+            if (fits) {
+                runner->setup(n);
+                runner->upload();
+            }
 
             /* reference result for verification */
             bool have_ref = false;
@@ -1277,7 +1328,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 try {
                     if (have_ref) {
                         runner->setup(n);
-                        runner->prepare(v.base);
+                        runner->stage(v.base);
                         call();
                         size_t bad = runner->compare();
                         unsigned long long gbad = bad;
@@ -1294,7 +1345,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     }
                     if (o.check_only) continue;
 
-                    runner->prepare(v.base);
+                    runner->stage(v.base);
                     for (int w = 0; w < warm; ++w) call();
                     double sum = 0;
                     for (int it = 0; it < iters; ++it) {
@@ -1399,6 +1450,11 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             for (auto& kv : notes) std::printf("# n/a %s: %s\n", kv.first.c_str(), kv.second.c_str());
             if (o.check || o.check_only)
                 std::printf("# verification: %s\n", failures ? (std::to_string(failures) + " FAILED case(s)").c_str() : "all passed");
+            if (o.gpu && runner->reduction()) {
+                const mem::State& ms = mem::st();
+                std::printf("# local reductions on rank 0: %zu kernel, %zu MPI_Reduce_local, %zu host-staged\n",
+                            ms.reductions_kernel, ms.reductions_mpi, ms.reductions_staged);
+            }
         }
 
         if (rank == 0 && !o.csv.empty()) {

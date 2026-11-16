@@ -20,7 +20,7 @@ public:
         const int size = size_, rank = rank_;
         size_t total_recv = 0;
         T* ptmp = nullptr;
-        std::vector<T> tempbuf;
+        Buf<T> tempbuf;
 
         Tree bmtree = topo::build_in_order_bmtree(rank, size, root);
         vrank = (rank - root + size) % size;

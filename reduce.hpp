@@ -22,7 +22,7 @@ public:
                  Tree const& tree, size_t count_by_segment, int max_outstanding_reqs)
     {
         T* inbuf[2] = {nullptr, nullptr};
-        std::vector<T> inbuf_free[2], accumbuf_free;
+        Buf<T> inbuf_free[2], accumbuf_free;
         T* accumbuf = nullptr;
         const T* local_op_buffer = nullptr;
         const T* sendtmpbuf = sendbuf;
@@ -204,7 +204,7 @@ public:
         int io_root = size - 1;
         const T* use_this_sendbuf = sendbuf;
         T* use_this_recvbuf = recvbuf;
-        std::vector<T> tmpbuf;
+        Buf<T> tmpbuf;
         if (io_root != root && io_root == rank) {
             tmpbuf.resize(std::max<size_t>(count, 1));
             use_this_recvbuf = tmpbuf.data();
@@ -229,7 +229,7 @@ public:
             send(sbuf, count, dt_, root, TAG_REDUCE);
             return;
         }
-        std::vector<T> pml_buffer;
+        Buf<T> pml_buffer;
         if (size > 1) pml_buffer.resize(count);
 
         /* Initialize the receive buffer. */
@@ -262,7 +262,7 @@ public:
             return;
         }
 
-        std::vector<T> tmp_buf(count), rbuf_raw;
+        Buf<T> tmp_buf(count), rbuf_raw;
         if (rank != root) {
             rbuf_raw.resize(count);
             rbuf = rbuf_raw.data();
@@ -390,7 +390,7 @@ public:
         int num_children = tree.tree_nextsize;
         bool is_leaf = (tree.tree_nextsize == 0);
 
-        std::vector<T> reduce_buf(count), child_buf;
+        Buf<T> reduce_buf(count), child_buf;
         copy_elems(reduce_buf.data(), sendbuf, count);
 
         int num_reqs = 0;

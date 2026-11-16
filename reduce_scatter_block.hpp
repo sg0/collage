@@ -25,7 +25,7 @@ public:
         size_t count = rcount * (size_t)size;
         if (0 == count) return;
 
-        std::vector<T> recv_buf;
+        Buf<T> recv_buf;
         if (count > (size_t)INT_MAX) {
             /* large payload: reduce per block, then send to each rank */
             if (0 == rank) recv_buf.resize(rcount);
@@ -62,7 +62,7 @@ public:
             return;
         }
 #endif
-        std::vector<T> tmpbuf_v(totalcount), tmprecv_v(totalcount);
+        Buf<T> tmpbuf_v(totalcount), tmprecv_v(totalcount);
         T* tmpbuf = tmpbuf_v.data();
         T* tmprecv = tmprecv_v.data();
         copy_elems(tmpbuf, sbuf, totalcount);
@@ -150,7 +150,7 @@ public:
             return;
         }
         size_t totalcount = (size_t)comm_size * rcount;
-        std::vector<T> tmpbuf_v(totalcount), tmprecv_v(totalcount);
+        Buf<T> tmpbuf_v(totalcount), tmprecv_v(totalcount);
         T* tmpbuf = tmpbuf_v.data();
         T* tmprecv = tmprecv_v.data();
         copy_elems(tmpbuf, sbuf, totalcount);
@@ -227,7 +227,7 @@ public:
             return;
         }
         size_t totalcount = (size_t)comm_size * rcount;
-        std::vector<T> tmpbuf0(totalcount), tmpbuf1(totalcount);
+        Buf<T> tmpbuf0(totalcount), tmpbuf1(totalcount);
         T* psend = tmpbuf0.data();
         T* precv = tmpbuf1.data();
         copy_elems(psend, sbuf, totalcount);
@@ -309,7 +309,7 @@ public:
             return;
         }
         size_t totalcount = (size_t)comm_size * rcount;
-        std::vector<T> tmpbuf0(totalcount), tmpbuf1(totalcount);
+        Buf<T> tmpbuf0(totalcount), tmpbuf1(totalcount);
         T* psend = tmpbuf0.data();
         T* precv = tmpbuf1.data();
 

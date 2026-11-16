@@ -1,6 +1,6 @@
 # collage — point-to-point collective algorithm benchmark
 
-`collage` benchmarks the collective algorithms from OpenMPI's `coll/base`
+`collage` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
 is re-implemented with plain MPI point-to-point calls. You pick one collective,
 and `collage` times every algorithm for it (plus the MPI library's own
@@ -19,6 +19,8 @@ researchers, and, broadly the MPI Forum for continuing to steer HPC ahead.
 |---|---|
 | `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware p2p wrappers, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
+| `memory.hpp` | memory layer: host/GPU space, `Buf<T>` temporaries with a caching device allocator, overlap-safe copies, reduction dispatch |
+| `gpu_ops.hpp`, `gpu_reduce.cu` | element-wise reduction operators and their CUDA kernels (built with `make CUDA=1`) |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
 | `bench.cpp` | command-line driver, runtime datatype dispatch |
 
@@ -36,6 +38,8 @@ ar.ring(sbuf, rbuf, count, MPI_SUM);           // or any MPI_Op, including user 
 make                    # uses mpicxx, C++17
 make MPICXX=CC          # e.g. Cray wrappers
 make NO_LARGE_COUNT=1   # MPI-3 libraries without MPI_Send_c & co.
+make CUDA=1             # GPU buffers (--gpu); needs nvcc and a CUDA-aware MPI
+make CUDA=1 CUDA_HOME=/opt/cuda CUDA_ARCH=-arch=sm_90
 ```
 
 With an MPI-4 library, all counts go through the `MPI_*_c` large-count calls.
@@ -87,7 +91,10 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--max-mem B` | skip cases whose buffers exceed `B` per rank | `2G` |
 | `--check`, `--check-only` | verify against native MPI (and time / don't time) | off |
 | `--csv FILE` | `avg/min/max` µs and algorithmic bandwidth per (variant, size) | – |
-| `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomized by p (see below) | off |
+| `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
+| `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
+| `--gpu-reduce MODE` | local reductions on GPU data: `kernel`, `mpi` or `host` (see below) | `kernel` |
+| `--assume-cuda-aware` | use device buffers even if the library does not report CUDA awareness | off |
 
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
@@ -134,7 +141,7 @@ themselves only use point-to-point calls, derived datatypes and
 # 32 ranks -> 4 communicators of 8 ranks, 4 rings running at the same time
 mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8       # consecutive
 mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8:4     # members 4 apart
-mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8:0.45  # randomized, p = 0.45
+mpiexec -n 32 ./collage -c allgather -a ring --split-mask=8:0.45  # randomised, p = 0.45
 ```
 
 `--split-mask M[:K|:p]` splits the N processes into N/M communicators of M
@@ -151,7 +158,7 @@ optional suffix:
   ranks, and `K = N/M` gives `rank % (N/M)`. Example with N = 32 and
   `--split-mask=8:2`: `{0,2,…,14}`, `{1,3,…,15}`, `{16,18,…,30}`,
   `{17,19,…,31}`.
-* **`M:p`: randomized members, p ∈ [0, 1].** The group size stays M, but the
+* **`M:p`: randomised members, p ∈ [0, 1].** The group size stays M, but the
   members are reshuffled from the consecutive layout. The tool performs about
   p·N/2 swaps. Each swap exchanges two not-yet-moved ranks from different
   groups that are at most `R = M·(N/M)^p` apart on the line. As a result,
@@ -179,6 +186,17 @@ Without the option, the report describes a single group of all N ranks on
 #   ...
 ```
 
+The report contains:
+
+* how the groups were formed;
+* how far the layout is from consecutive: the number of non-consecutive
+  groups, the fraction of ranks outside their consecutive group, the mean gap
+  between neighbouring members and the largest group span;
+* how the ranks sit on nodes: the node count, ranks per node, and whether
+  the launcher placed ranks in blocks or round-robin;
+* how many nodes each group spans, and how many groups stay inside one node;
+* the first four groups' members, each with its node count.
+
 Nodes are identified by host name (`MPI_Get_processor_name`). The report shows
 how a given layout interacts with the launcher's placement. For example,
 `8:4` spreads every group over 4 nodes with block placement, but keeps each
@@ -205,6 +223,63 @@ How groups map onto nodes depends on how the launcher places ranks. For
 example, with 8 ranks per node packed by core, `--split-mask 8` puts each
 group inside one node, `--split-mask 8:K` with K ≥ 8 spreads each group over
 8 nodes, and `M:p` gives everything in between.
+
+### GPU buffers (`--gpu`)
+
+```bash
+make CUDA=1
+mpirun -np 16 ./collage -c allreduce --gpu --check            # device buffers, CUDA reduction kernels
+mpirun -np 16 ./collage -c allreduce --gpu --gpu-reduce mpi    # let MPI_Reduce_local reduce device data
+mpirun -np 64 ./collage -c allgather -a ring --gpu --split-mask=8
+```
+
+With `--gpu`, every buffer an algorithm touches is in GPU memory, not only
+the user buffers. MPI calls receive device pointers, which is why the library
+must be CUDA-aware. The algorithms are unchanged, but the three things they do
+outside MPI are routed through `memory.hpp`:
+
+| what | host build / no `--gpu` | `--gpu` |
+|---|---|---|
+| temporary buffers (`Buf<T>`) | `new T[n]()` | `cudaMalloc`, served from a caching pool so that per-call temporaries cost no `cudaMalloc` after warm-up |
+| local copies (rotations, self blocks, packing) | `memmove` | `cudaMemcpyAsync` + stream sync; overlapping ranges go through a temporary, since `cudaMemcpy` is undefined for overlap |
+| local reductions | `MPI_Reduce_local` | `--gpu-reduce`: `kernel` = CUDA kernels for every predefined op × type (default); `mpi` = `MPI_Reduce_local` on device pointers (only if your library supports it); `host` = stage through pinned host memory |
+
+User-defined ops (`-o user`, `-o user_nc`) are always reduced on the host,
+because their function is CPU code. The run reports how many local reductions
+on rank 0 took each path. Indexed derived datatypes are still passed to MPI
+(alltoall `bruck`, allgatherv `bruck`/`neighborexchange`/`basic_default`,
+reduce_scatter_block `recursivedoubling`). This relies on the library
+supporting non-contiguous datatypes in device memory, which Open MPI and MPICH
+do.
+
+* **Which GPU.** Each process uses device `local rank % visible devices`. The
+  local rank is read from the launcher's environment before `MPI_Init`
+  (`OMPI_COMM_WORLD_LOCAL_RANK`, `MV2_COMM_WORLD_LOCAL_RANK`,
+  `MPI_LOCALRANKID`, `PMI_LOCAL_RANK`, `PALS_LOCAL_RANKID`, `SLURM_LOCALID`,
+  `FLUX_TASK_LOCAL_ID`), because several CUDA-aware MPIs set up their CUDA
+  context inside `MPI_Init`. Otherwise it comes from an `MPI_COMM_TYPE_SHARED`
+  split after init. If the launcher binds one GPU per process
+  (`CUDA_VISIBLE_DEVICES`, `--gpus-per-task=1`), every process simply uses its
+  only visible device. The header names rank 0's device and the source of the
+  local rank.
+* **CUDA awareness.** The library is asked: Open MPI via
+  `MPIX_Query_cuda_support()`, MPICH ≥ 4 via `MPIX_GPU_query_support()`. If
+  any rank answers "no", the run stops, because device pointers would crash a
+  non-CUDA-aware library. `--assume-cuda-aware` overrides that.
+  "Unknown" (no query available) gives a warning and continues.
+* **Timing.** Every local copy and kernel synchronises the stream before
+  returning, because the next step is usually an MPI call on the same buffer.
+  This is the same constraint an MPI library's own GPU path has, so the
+  timings include it. Inputs are generated on the host and uploaded, and
+  `--check` downloads results. Neither transfer is inside the timed region.
+* **Baseline.** `native` passes the same device buffers to the library's own
+  collective, i.e. its CUDA-aware path.
+* **Memory.** `--max-mem` then limits GPU memory per process. Cached device
+  blocks are released before `MPI_Finalize`.
+* **Caveats.** Whether the native collective (and therefore `--check`)
+  supports a user-defined op on device buffers depends on the library; prefer
+  predefined ops on GPUs. The `mpi` reduce mode likewise depends on the
+  library accepting device pointers in `MPI_Reduce_local`.
 
 ## Reduction operations
 
@@ -250,7 +325,9 @@ recursive-doubling allgather becomes `k_bruck(2)` on non-power-of-two sizes,
 neighbor exchange becomes `ring` on odd sizes, and `scatter_allgather` becomes
 `linear` when `count < size`.
 
-**Composite algorithms.** 
+**Composite algorithms.** Upstream, these call "whatever collective is
+selected on the communicator". Here they are wired to fixed point-to-point
+sub-algorithms, so nothing reaches the MPI library's collectives:
 
 | algorithm | sub-steps used here |
 |---|---|
@@ -267,14 +344,12 @@ To use different sub-steps, change the corresponding line in the header.
 
 `--check` runs the native MPI collective once per size to build the
 reference. It then re-initializes the inputs, runs each algorithm once on
-poisoned output buffers, and compares the result element by element. The
-comparison covers the root for rooted collectives and every rank otherwise.
-Inputs are small integers chosen per operation, so floating-point sums and
-products are exact whatever the reduction order. Verification study is 
-currently ongoing, please file bugs.
+poisoned output buffers, and compares the result element by element. 
+
+Verification study is currently ongoing, please file bugs.
 
 ## License
 
 collage is distributed under the 3-clause BSD license. The algorithm headers
-are derived from OpenMPI and also carry OpenMPI's BSD license and copyright
+are derived from Open MPI and also carry Open MPI's BSD license and copyright
 notices. See [LICENSE](LICENSE) for both.
