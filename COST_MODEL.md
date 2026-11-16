@@ -1,4 +1,4 @@
-# Cost model of the collage algorithms
+# Cost model of the MPI algorithms
 
 The two tables give the **latency** (α) and **bandwidth** (β, plus γ for
 reductions) terms of every algorithm in collage, as implemented in the headers.
