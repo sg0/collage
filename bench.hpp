@@ -67,6 +67,7 @@ struct Options {
     bool native = true;                     /* include the native MPI baseline */
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
+    std::string tag;                        /* free-form label copied into every CSV row */
     bool quiet = false;
     int split_mask = 0;                     /* >0: run on N/M concurrent groups of M ranks */
     int split_stride = 1;                   /* M:K  -> members exactly K ranks apart */
@@ -75,6 +76,7 @@ struct Options {
     bool gpu = false;                       /* --gpu: user buffers and temporaries in GPU memory */
     std::string gpu_reduce = "kernel";      /* kernel | mpi | host (local reductions on GPU data) */
     bool assume_cuda_aware = false;         /* skip the library's CUDA-awareness answer */
+    std::vector<int> gpu_map;               /* --gpu-map: local rank -> device */
     std::vector<std::string> gpu_report;    /* header lines prepared by the driver */
 };
 
@@ -1299,6 +1301,16 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             const int warm = large ? o.warmup_large : o.warmup;
 
             bool fits = runner->mem_bytes(n) <= o.max_mem;
+            std::string skip_note = "exceeds --max-mem";
+#if !COLLAGE_LARGE_COUNT
+            /* MPI-3 library: a single count must fit in an int. Decide on a
+             * rank-independent bound so that every rank skips the same cases
+             * (a count error on some ranks only would deadlock the rest). */
+            if (fits && runner->mem_bytes(n) / sizeof(T) > (size_t)INT_MAX) {
+                fits = false;
+                skip_note = "count may exceed INT_MAX (MPI library without MPI-4 large counts)";
+            }
+#endif
             if (fits) {
                 runner->setup(n);
                 runner->upload();
@@ -1318,7 +1330,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 size_t extra = (v.def && v.def->extra_mem) ? v.def->extra_mem(n) : 0;
                 if (!fits || runner->mem_bytes(n) + extra > o.max_mem) {
                     cell.state = Cell::Skip;
-                    cell.note = "exceeds --max-mem";
+                    cell.note = fits ? "exceeds --max-mem" : skip_note;
                     continue;
                 }
                 auto call = [&]() {
@@ -1471,8 +1483,18 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             if (!f) {
                 std::fprintf(stderr, "cannot open %s for writing\n", o.csv.c_str());
             } else {
-                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,groups,group_ranks,layout,root,bytes,count,"
-                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,note\n");
+                /* run-wide context, so CSV files from different jobs can be concatenated */
+                const int csv_nodes = node_of.empty() ? 1 : 1 + *std::max_element(node_of.begin(), node_of.end());
+                std::vector<int> per_node(csv_nodes, 0);
+                for (int r : node_of) per_node[r]++;
+                const int csv_ppn = per_node.empty() ? size : *std::max_element(per_node.begin(), per_node.end());
+                const std::string csv_buffers = o.gpu ? "gpu" : "host";
+                const std::string csv_reduce = o.gpu && runner->reduction() ? o.gpu_reduce : "-";
+                std::string csv_tag = o.tag;
+                std::replace(csv_tag.begin(), csv_tag.end(), ',', ';');
+                std::fprintf(f, "collective,algorithm,variant,type,op,ranks,nodes,ranks_per_node,buffers,gpu_reduce,"
+                                "groups,group_ranks,layout,root,bytes,count,"
+                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,tag,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
                         const Cell& c = results[ci][vi];
@@ -1484,11 +1506,21 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                         if ((c.state == Cell::Ok || c.state == Cell::Fail) && c.avg > 0) bw = pb / c.avg;  /* B/us == MB/s */
                         std::string note = c.note;
                         std::replace(note.begin(), note.end(), ',', ';');
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s\n",
-                                     o.coll.c_str(), variants[vi].base.c_str(), variants[vi].label.c_str(),
-                                     type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, groups,
-                                     gsize, layout.c_str(), o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw,
-                                     c.aggbw, note.c_str());
+                        /* RFC 4180: a variant label with several tunables, e.g.
+                         * chain[seg=8K,fo=4], contains commas and is quoted */
+                        auto field = [](const std::string& v) {
+                            if (v.find_first_of(",\"\n") == std::string::npos) return v;
+                            std::string q = "\"";
+                            for (char ch : v) q += ch == '"' ? std::string("\"\"") : std::string(1, ch);
+                            return q + "\"";
+                        };
+                        const std::string csv_variant = field(variants[vi].label), csv_layout = field(layout);
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s,%s\n",
+                                     o.coll.c_str(), variants[vi].base.c_str(), csv_variant.c_str(),
+                                     type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, csv_nodes,
+                                     csv_ppn, csv_buffers.c_str(), csv_reduce.c_str(), groups, gsize, csv_layout.c_str(),
+                                     o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw, c.aggbw,
+                                     csv_tag.c_str(), note.c_str());
                     }
                 std::fclose(f);
                 if (!o.quiet) std::printf("# statistics written to %s\n", o.csv.c_str());

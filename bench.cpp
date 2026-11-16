@@ -8,6 +8,7 @@
  * Run with --help for all options.
  */
 #include <cstdio>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -124,6 +125,7 @@ void usage()
         "      --check            verify every algorithm against the native MPI collective\n"
         "      --check-only       verify, do not time\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
+        "      --tag TEXT         label copied into every CSV row (e.g. job id, study)\n"
         "  -q, --quiet            no table on stdout\n"
         "\n"
         "GPU buffers (needs a CUDA-aware MPI and a build with `make CUDA=1`)\n"
@@ -134,7 +136,9 @@ void usage()
         "                         | host (staged through pinned host memory).\n"
         "                         User-defined ops (-o user, user_nc) always use host.\n"
         "      --assume-cuda-aware  run even if the MPI library does not report CUDA\n"
-        "                         awareness (for libraries that cannot be queried)\n");
+        "                         awareness (for libraries that cannot be queried)\n"
+        "      --gpu-map LIST     device of each local rank, map[local rank %% size],\n"
+        "                         e.g. 3,2,1,0 (default: local rank %% visible GPUs)\n");
 }
 
 /* --split-mask M        groups of M consecutive ranks
@@ -236,7 +240,13 @@ Options parse(int argc, char** argv, bool& list, bool& help)
                 throw std::invalid_argument("--gpu-reduce must be kernel, mpi or host");
         }
         else if (a == "--assume-cuda-aware") o.assume_cuda_aware = true;
+        else if (a == "--gpu-map") {
+            o.gpu_map = parse_int_list(v());
+            for (int d : o.gpu_map)
+                if (d < 0) throw std::invalid_argument("--gpu-map: device ids must be >= 0");
+        }
         else if (a == "--csv") o.csv = v();
+        else if (a == "--tag") o.tag = v();
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
@@ -347,20 +357,50 @@ bool argv_has(int argc, char** argv, const char* opt)
     return false;
 }
 
+/* value of "--opt V" or "--opt=V" before MPI_Init (empty if absent) */
+std::string argv_value(int argc, char** argv, const char* opt)
+{
+    const size_t n = std::strlen(opt);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], opt) == 0 && i + 1 < argc) return argv[i + 1];
+        if (std::strncmp(argv[i], opt, n) == 0 && argv[i][n] == '=') return argv[i] + n + 1;
+    }
+    return "";
+}
+
 #if defined(COLLAGE_CUDA)
 /* select the GPU (if not done before MPI_Init), check CUDA awareness,
  * configure the memory layer and prepare the header lines */
-void setup_gpu(Options& o, int pre_local, const std::string& pre_from, int rank)
+void setup_gpu(Options& o, int pre_local, const std::string& pre_from, const std::string& pre_err, int rank)
 {
     int local = pre_local;
     std::string from = pre_from;
-    if (local < 0) {
+    /* Ranks whose device could not be set before MPI_Init (no launcher local
+     * rank, or a bad --gpu-map entry) select it now. The split is collective,
+     * so every rank takes part when any rank needs it, and a failure on some
+     * ranks is agreed on before throwing, so no rank is left waiting. */
+    std::string err = pre_err;  /* a device chosen before MPI_Init that failed is not retried */
+    int need = (local < 0 && err.empty()) ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &need, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (need) {
         MPI_Comm node;
+        int node_local = 0;
         MPI_CHECK(MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node));
-        MPI_Comm_rank(node, &local);
+        MPI_Comm_rank(node, &node_local);
         MPI_Comm_free(&node);
-        from = "MPI_COMM_TYPE_SHARED, after MPI_Init";
-        mem::select_device(local);
+        if (local < 0 && err.empty()) {
+            local = node_local;
+            from = "MPI_COMM_TYPE_SHARED, after MPI_Init";
+            try { mem::select_device(local, o.gpu_map); } catch (const std::exception& e) { err = e.what(); }
+        }
+    }
+    int bad = err.empty() ? 0 : 1, first_bad = bad ? rank : INT_MAX;
+    MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &first_bad, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (bad) {
+        if (rank == first_bad)
+            std::fprintf(stderr, "collage: rank %d (local rank %d): %s\n", rank, local, err.c_str());
+        throw std::runtime_error("--gpu: device selection failed (see the message above)");
     }
     std::string how;
     int aware = cuda_aware(how);
@@ -379,8 +419,15 @@ void setup_gpu(Options& o, int pre_local, const std::string& pre_from, int rank)
     int ndev = mem::device_count();
     o.gpu_report.push_back("# buffers      : GPU memory (CUDA), one device per process");
     o.gpu_report.push_back("#                rank 0 on " + mem::device_name());
-    o.gpu_report.push_back("#                device = local rank % " + std::to_string(ndev) +
-                           " visible device(s); local rank from " + from);
+    std::string mapping;
+    if (o.gpu_map.empty()) {
+        mapping = "local rank % " + std::to_string(ndev) + " visible device(s)";
+    } else {
+        mapping = "--gpu-map ";
+        for (size_t i = 0; i < o.gpu_map.size(); ++i) mapping += (i ? "," : "") + std::to_string(o.gpu_map[i]);
+        mapping += " indexed by local rank (" + std::to_string(ndev) + " visible)";
+    }
+    o.gpu_report.push_back("#                device = " + mapping + "; local rank from " + from);
     std::string verdict = all == 1 ? "yes" : any_no ? "NO (overridden by --assume-cuda-aware)" : "unknown";
     o.gpu_report.push_back("# CUDA-aware   : " + verdict + " (" + how + ")");
     if (all == -1 && !any_no && rank == 0)
@@ -395,12 +442,21 @@ int main(int argc, char** argv)
      * local rank: several CUDA-aware MPIs set up their CUDA context in MPI_Init. */
     const bool want_gpu = argv_has(argc, argv, "--gpu");
     (void)want_gpu;
-    std::string pre_from;
+    std::string pre_from, pre_err;
     int pre_local = -1;
 #if defined(COLLAGE_CUDA)
     if (want_gpu) {
         pre_local = env_local_rank(pre_from);
-        if (pre_local >= 0) mem::select_device(pre_local);
+        if (pre_local >= 0) {
+            std::vector<int> map;
+            try {
+                std::string mv = argv_value(argc, argv, "--gpu-map");
+                if (!mv.empty()) map = parse_int_list(mv);
+                mem::select_device(pre_local, map);
+            } catch (const std::exception& e) {
+                pre_err = e.what(); /* bad option or device: reported by every rank after MPI_Init */
+            }
+        }
     }
 #endif
     MPI_Init(&argc, &argv);
@@ -412,7 +468,7 @@ int main(int argc, char** argv)
         Options o = parse(argc, argv, list, help);
         if (o.gpu && !help && !list) {
 #if defined(COLLAGE_CUDA)
-            setup_gpu(o, pre_local, pre_from, rank);
+            setup_gpu(o, pre_local, pre_from, pre_err, rank);
 #else
             (void)pre_local;
             throw std::invalid_argument("--gpu: this binary was built without CUDA support (rebuild with `make CUDA=1`)");
