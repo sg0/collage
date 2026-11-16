@@ -6,6 +6,10 @@
 #   make NO_LARGE_COUNT=1      MPI-3 libraries without MPI_Send_c & co.
 MPICXX    ?= mpicxx
 CXXFLAGS  ?= -O3 -std=c++17 -Wall -Wextra
+
+# the binary is the default target, whatever order the rules below come in
+.DEFAULT_GOAL := collage
+all: collage
 LDFLAGS   ?=
 LIBS      ?=
 
@@ -26,14 +30,19 @@ LDFLAGS   += -L$(CUDA_HOME)/lib64
 LIBS      += -lcudart
 OBJS      += gpu_reduce.o
 
-gpu_reduce.o: gpu_reduce.cu gpu_ops.hpp
+gpu_reduce.o: gpu_reduce.cu gpu_ops.hpp .build-config
 	$(NVCC) $(NVCCFLAGS) -c -o $@ gpu_reduce.cu
 endif
 
-collage: bench.cpp $(HEADERS) $(OBJS)
+BUILD_CONFIG := $(MPICXX) $(CXXFLAGS) $(OBJS) $(LDFLAGS) $(LIBS) $(NVCCFLAGS)
+.build-config: FORCE
+	@echo '$(BUILD_CONFIG)' | cmp -s - $@ || echo '$(BUILD_CONFIG)' > $@
+
+collage: bench.cpp $(HEADERS) $(OBJS) .build-config
 	$(MPICXX) $(CXXFLAGS) -o $@ bench.cpp $(OBJS) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f collage gpu_reduce.o
+	rm -f collage gpu_reduce.o .build-config
 
-.PHONY: clean
+FORCE:
+.PHONY: all clean FORCE
