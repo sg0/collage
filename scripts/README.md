@@ -35,11 +35,11 @@ reduction kernels are built for `sm_80`.
 ## 2. Submit
 
 ```bash
-perlmutter/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
-perlmutter/submit_study.sh split gpu
-perlmutter/submit_study.sh all both        # every study on both node types: 24 jobs
-NODE_COUNTS="16 128" TIME=08:00:00 perlmutter/submit_study.sh tunables cpu
-sbatch -N 64 perlmutter/collage_split_cpu.sbatch   # a single job
+scripts/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
+scripts/submit_study.sh split gpu
+scripts/submit_study.sh all both        # every study on both node types: 24 jobs
+NODE_COUNTS="16 128" TIME=08:00:00 scripts/submit_study.sh tunables cpu
+sbatch -N 64 scripts/collage_split_cpu.sbatch   # a single job
 ```
 
 All scripts use account `m4626` and `-q regular`. Override these with
@@ -48,13 +48,13 @@ at most 8 nodes and 30 minutes, so it suits a smoke test:
 
 ```bash
 NODE_COUNTS=2 QOS=debug TIME=00:20:00 COLLS=allreduce PPN_LIST=128 \
-    perlmutter/submit_study.sh algos cpu
+    scripts/submit_study.sh algos cpu
 ```
 
 To print the plan without running anything (on a login node):
 
 ```bash
-DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash perlmutter/collage_split_cpu.sbatch
+DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash scripts/collage_split_cpu.sbatch
 ```
 
 ### Resubmit until done
