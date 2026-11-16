@@ -397,9 +397,17 @@ schedules identical. These are the changes:
 reference. It then re-initialises the inputs, runs each algorithm once on
 poisoned output buffers, and compares the result element by element. 
 
-## Studies on Perlmutter
+## Cost model
 
-`scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
+[COST_MODEL.md](COST_MODEL.md) has two tables, latency (α) and bandwidth
+(β, plus γ for reductions), giving the Hockney cost of every algorithm above.
+They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
+`--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
+itself.
+
+## Job and plotting scripts
+
+`scripts/` holds batch job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and
 algorithm tunables (`tunables`). `scripts/plot_collage.py` turns their CSV
 output into figures. Build, submission and plotting are described in
