@@ -72,7 +72,7 @@ public:
         T* tmpsend = tmprecv;
         if (comm_size == 1) return;
 
-        std::vector<MPI_Request> requests(2 * (size_t)comm_size, MPI_REQUEST_NULL);
+        std::vector<Request> requests(2 * (size_t)comm_size, REQUEST_NULL);
 
         comm_log = (int)std::ceil(std::log((double)comm_size) / std::log(2.0));
         distance <<= comm_log - 1;
@@ -219,8 +219,8 @@ public:
             if (rank != root) {
                 recv(rbuf, 1, newtype, root, TAG_ALLGATHERV);
             } else {
-                std::vector<MPI_Request> reqs(size - 1, MPI_REQUEST_NULL);
-                MPI_Request* preq = reqs.data();
+                std::vector<Request> reqs(size - 1, REQUEST_NULL);
+                Request* preq = reqs.data();
                 for (int i = 0; i < size; ++i) {
                     if (i == rank) continue;
                     isend(rbuf, 1, newtype, i, TAG_ALLGATHERV, preq++);

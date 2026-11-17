@@ -21,8 +21,8 @@ public:
         int num_segments;
         size_t sendcount;
         T* tmpbuf = buffer;
-        MPI_Request recv_reqs[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
-        std::vector<MPI_Request> send_reqs(std::max(tree.tree_nextsize, 1), MPI_REQUEST_NULL);
+        Request recv_reqs[2] = {REQUEST_NULL, REQUEST_NULL};
+        std::vector<Request> send_reqs(std::max(tree.tree_nextsize, 1), REQUEST_NULL);
 
         if (size_ < 2) return;
         /* zero-size broadcast: run the algorithm with one empty segment */
@@ -127,7 +127,7 @@ public:
         size_t counts[2], segcount[2], sendcount[2], realsegsize[2];
         int num_segments[2];
         T* tmpbuf[2];
-        MPI_Request base_req, new_req;
+        Request base_req, new_req;
         const size_t type_size = sizeof(T);
 
         if (size == 1) return;
@@ -241,8 +241,8 @@ public:
             recv(buff, count, dt_, root, TAG_BCAST);
             return;
         }
-        std::vector<MPI_Request> reqs(size - 1, MPI_REQUEST_NULL);
-        MPI_Request* preq = reqs.data();
+        std::vector<Request> reqs(size - 1, REQUEST_NULL);
+        Request* preq = reqs.data();
         for (int i = 0; i < size; ++i) {
             if (i == rank) continue;
             isend(buff, count, dt_, i, TAG_BCAST, preq++);

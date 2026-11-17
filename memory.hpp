@@ -24,9 +24,13 @@
  * built (mem::configure). Without COLLAGE_CUDA only the host space exists and
  * the behaviour is the plain host one.
  *
- * Every device operation is synchronous with respect to the host (the stream
- * is synchronised before returning), because the next step is usually an MPI
- * call on the same buffer and MPI does not know about our stream.
+ * By default every device operation is synchronous with respect to the host
+ * (the stream is synchronised before returning), because the next step is
+ * usually an MPI call on the same buffer and MPI does not know about our
+ * stream. With a stream-triggered transport (--transport mpich|acx|cray, see
+ * transport.hpp) the MPI calls are queued on the same stream, so copies and
+ * kernel reductions are only queued too (async mode): the stream orders them,
+ * and the host waits only where it has to (sync()).
  */
 
 #include <mpi.h>
@@ -81,6 +85,11 @@ struct State {
     size_t stage_bytes = 0;
     int device = -1;
 #endif
+    /* async mode (stream-triggered transports): queue device work, do not wait */
+    bool async = false;
+    bool pending = false;              /* work queued since the last sync() */
+    void (*before_stream_op)() = nullptr; /* transport hook, run before queueing work */
+    void (*before_sync)() = nullptr;      /* transport hook, run before waiting */
     /* statistics, for the run header / debugging */
     size_t reductions_kernel = 0, reductions_mpi = 0, reductions_staged = 0;
 };
@@ -98,13 +107,20 @@ inline bool device() { return st().space == Space::Device; }
 /* ------------------------------------------------------------------------- */
 #if defined(COLLAGE_CUDA)
 /* Pick the GPU for this process. Call before MPI_Init when the local rank is
- * known from the launcher, otherwise after (see bench.cpp). */
-inline int select_device(int local_rank)
+ * known from the launcher, otherwise after (see bench.cpp).
+ * Without a map: device = local_rank % visible devices.
+ * With a map (--gpu-map 3,2,1,0): device = map[local_rank % map size], e.g. to
+ * give each rank the GPU closest to the cores it is bound to. */
+inline int select_device(int local_rank, const std::vector<int>& map = {})
 {
     int n = 0;
     CUDA_CHECK(cudaGetDeviceCount(&n));
     if (n <= 0) throw std::runtime_error("--gpu: no CUDA device visible to this process");
-    int dev = local_rank >= 0 ? local_rank % n : 0;
+    const int lr = local_rank >= 0 ? local_rank : 0;
+    int dev = map.empty() ? lr % n : map[(size_t)lr % map.size()];
+    if (dev < 0 || dev >= n)
+        throw std::runtime_error("--gpu-map: device " + std::to_string(dev) + " does not exist (" +
+                                 std::to_string(n) + " visible)");
     CUDA_CHECK(cudaSetDevice(dev));
     st().device = dev;
     return dev;
@@ -211,8 +227,32 @@ inline bool overlap(const void* a, const void* b, size_t bytes)
 inline void sync()
 {
 #if defined(COLLAGE_CUDA)
-    if (device()) CUDA_CHECK(cudaStreamSynchronize(st().stream));
+    if (device()) {
+        if (st().before_sync) st().before_sync();
+        CUDA_CHECK(cudaStreamSynchronize(st().stream));
+    }
 #endif
+    st().pending = false;
+}
+
+/* async mode: something was queued on the stream */
+inline void mark_pending() { st().pending = true; }
+inline bool pending() { return st().pending; }
+/* wait for queued work, if any (before the host touches device data) */
+inline void sync_if_pending()
+{
+    if (st().pending) sync();
+}
+/* before queueing a copy or a kernel */
+inline void before_stream_op()
+{
+    if (st().before_stream_op) st().before_stream_op();
+}
+/* after queueing work: wait for it, or only note it in async mode */
+inline void queued()
+{
+    if (st().async) mark_pending();
+    else sync();
 }
 
 /* memmove semantics in the current memory space. With --gpu both pointers
@@ -222,16 +262,20 @@ inline void copy(void* dst, const void* src, size_t bytes)
     if (bytes == 0 || dst == src) return;
 #if defined(COLLAGE_CUDA)
     if (device()) {
+        before_stream_op();
         if (overlap(dst, src, bytes)) {
-            /* cudaMemcpy is undefined for overlapping ranges: go through a temporary */
+            /* cudaMemcpy is undefined for overlapping ranges: go through a temporary.
+             * In async mode the block goes back to the pool before the copies
+             * run; that is safe because every later user of device memory is
+             * either queued behind them or waits for the stream first. */
             void* t = device_alloc(bytes);
             CUDA_CHECK(cudaMemcpyAsync(t, src, bytes, cudaMemcpyDefault, st().stream));
             CUDA_CHECK(cudaMemcpyAsync(dst, t, bytes, cudaMemcpyDefault, st().stream));
-            sync();
+            queued();
             device_free(t);
         } else {
             CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, st().stream));
-            sync();
+            queued();
         }
         return;
     }
@@ -252,6 +296,7 @@ inline void upload(void* dst, const void* host_src, size_t bytes)
 #endif
     if (dst != host_src) std::memmove(dst, host_src, bytes);
 }
+/* (upload/download wait for the stream, so they also order behind queued work) */
 inline void download(void* host_dst, const void* src, size_t bytes)
 {
     if (bytes == 0) return;
@@ -332,6 +377,7 @@ inline void reduce_staged(const void* in, void* inout, size_t count, MPI_Datatyp
         }
         s.stage_bytes = bytes;
     }
+    before_stream_op();
     CUDA_CHECK(cudaMemcpyAsync(s.stage[0], in, bytes, cudaMemcpyDeviceToHost, s.stream));
     CUDA_CHECK(cudaMemcpyAsync(s.stage[1], inout, bytes, cudaMemcpyDeviceToHost, s.stream));
     sync();
@@ -355,12 +401,14 @@ inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, M
             return;
         }
         if (s.rmode == ReduceMode::Mpi) {
+            sync_if_pending();  /* MPI_Reduce_local does not know our stream */
             reduce_local_mpi(in, inout, count, dt, op);
             ++s.reductions_mpi;
             return;
         }
+        before_stream_op();
         if (collage_gpu::device_reduce(dtype_code(dt), (collage_gpu::OpCode)oc, in, inout, count, s.stream)) {
-            sync();
+            queued();
             ++s.reductions_kernel;
             return;
         }

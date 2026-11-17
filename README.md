@@ -20,11 +20,12 @@ HPC ahead.
 |---|---|
 | `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware p2p wrappers, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
+| `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, or stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs (`--transport`) |
 | `memory.hpp` | memory layer: host/GPU space, `Buf<T>` temporaries with a caching device allocator, overlap-safe copies, reduction dispatch |
 | `gpu_ops.hpp`, `gpu_reduce.cu` | element-wise reduction operators and their CUDA kernels (built with `make CUDA=1`) |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
 | `bench.cpp` | command-line driver, runtime datatype dispatch |
-| `perlmutter/` | Slurm job scripts for parameter studies on NERSC Perlmutter (see [perlmutter/README.md](perlmutter/README.md)) |
+| `scripts/` | Slurm job scripts for parameter studies on NERSC Perlmutter (see [perlmutter/README.md](perlmutter/README.md)) |
 | `plots/plot_collage.py` | seaborn figures from the CSV output of those studies (or any `--csv` file) |
 
 The headers can also be used on their own:
@@ -43,6 +44,9 @@ make MPICXX=CC          # e.g. Cray wrappers
 make NO_LARGE_COUNT=1   # MPI-3 libraries without MPI_Send_c & co.
 make CUDA=1             # GPU buffers (--gpu); needs nvcc and a CUDA-aware MPI
 make CUDA=1 CUDA_HOME=/opt/cuda CUDA_ARCH=-arch=sm_90
+make CUDA=1 ST=cray     # + stream-triggered transport, see "Stream-triggered transports"
+make CUDA=1 ST=mpich    #   (one of cray, mpich, acx per binary; mpi is always there)
+make CUDA=1 ST=acx ACX_HOME=$HOME/mpi-acx CUDA_ARCH=-arch=sm_80
 ```
 
 With an MPI-4 library, all counts go through the `MPI_*_c` large-count calls.
@@ -98,6 +102,10 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
 | `--gpu-reduce MODE` | local reductions on GPU data: `kernel`, `mpi` or `host` (see below) | `kernel` |
 | `--assume-cuda-aware` | use device buffers even if the library does not report CUDA awareness | off |
+| `--transport T` | with `--gpu`: `mpi` (CUDA-aware MPI, host-driven), or stream-triggered `cray`, `mpich`, `acx` (needs a binary built with `ST=T`) | `mpi` |
+| `--st-peers P` | stream-triggered transports: `inter` = queue only messages to other nodes, `all` = every message | `inter` |
+| `--mpich-progress-thread` | `--transport mpich`: start MPICH's stream progress thread | off |
+| `--thread-multiple` | initialise MPI with `MPI_THREAD_MULTIPLE` for the plain transport too | off |
 
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
@@ -275,8 +283,9 @@ do.
   any rank answers "no", the run stops, because device pointers would crash a
   non-CUDA-aware library. `--assume-cuda-aware` overrides that.
   "Unknown" (no query available) gives a warning and continues.
-* **Timing.** Every local copy and kernel synchronises the stream before
-  returning, because the next step is usually an MPI call on the same buffer.
+* **Timing.** With the default transport, every local copy and kernel
+  synchronises the stream before returning (stream-triggered transports
+  queue them instead, see below), because the next step is usually an MPI call on the same buffer.
   This is the same constraint an MPI library's own GPU path has, so the
   timings include it. Inputs are generated on the host and uploaded, and
   `--check` downloads results. Neither transfer is inside the timed region.
@@ -288,6 +297,103 @@ do.
   supports a user-defined op on device buffers depends on the library; prefer
   predefined ops on GPUs. The `mpi` reduce mode likewise depends on the
   library accepting device pointers in `MPI_Reduce_local`.
+
+### Stream-triggered transports (`--transport`)
+
+```bash
+make CUDA=1 ST=cray                       # Perlmutter (Slingshot), Cray MPICH
+srun -N 16 --ntasks-per-node=4 ./collage -c allreduce --gpu --transport cray --check
+make CUDA=1 ST=acx ACX_HOME=~/mpi-acx     # InfiniBand/RoCE, e.g. Open MPI / HPC-X
+mpirun -np 64 ./collage -c allreduce --gpu --transport acx --check
+make CUDA=1 ST=mpich                      # MPICH >= 4.1 built with CUDA (any network)
+MPIR_CVAR_CH4_RESERVE_VCIS=1 mpirun -np 64 ./collage -c bcast --gpu --transport mpich
+```
+
+By default (`--transport mpi`), the host drives every algorithm. It waits for
+each local copy or reduction kernel, then calls CUDA-aware MPI. With a
+stream-triggered transport, the algorithm runs **in stream order** instead.
+Its sends, receives and waits are queued on the CUDA stream together with the
+copies and reduction kernels. The host only queues work, and the GPU stream
+(through the library) triggers the communication when it reaches it. The
+algorithms themselves are unchanged. All the transport-specific code is in
+`transport.hpp`.
+
+| `--transport` | library | API used | typical system |
+|---|---|---|---|
+| `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
+| `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
+| `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) over any MPI | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+
+* **Only messages to other nodes are queued** (`--st-peers inter`, the
+  default). Messages to peers on the same node keep CUDA-aware MPI, which
+  moves them with CUDA IPC over NVLink/PCIe. Before such a call, the host waits
+  for the stream, because the call may read or write data that queued work is
+  still using. `--st-peers all` queues every message. Nodes are identified by
+  `MPI_Get_processor_name`. The footer reports, for rank 0, how many messages
+  were queued, how many were plain, and how often the host had to wait.
+* **Thread level.** All three libraries call MPI from their own threads:
+  MPI-ACX's proxy thread, and MPICH's GPU host functions or progress thread.
+  collage therefore initialises MPI with `MPI_THREAD_MULTIPLE` whenever a
+  stream-triggered transport is selected, and stops if the library provides
+  less. `--thread-multiple` gives the plain transport the same thread level,
+  for an apples-to-apples baseline.
+* **Timing.** The timed region of one call covers queueing everything, then
+  waiting for the stream once (`xport::drain()`). Local copies and kernels no
+  longer synchronise individually. Only a user-defined op (reduced on the host),
+  `--gpu-reduce mpi`/`host`, or a plain on-node call makes the host wait in the
+  middle of an algorithm.
+* **Mapping of MPI calls.** A blocking send or receive becomes a queued
+  isend/irecv plus a queued wait, so the *stream* blocks, not the host.
+  `MPI_Ssend` and `MPI_Issend` become standard sends on the queued path, because
+  the enqueue APIs have no synchronous mode. Persistent requests (alltoall(v)
+  `linear`) are emulated and started as queued isend/irecv. The host cannot see which
+  queued operation finishes first, so `MPI_Waitany` (alltoall `linear_sync`)
+  makes the stream wait for every active request, then reports the completed
+  ones one per call. `linear_sync` therefore advances window by window.
+* **Statuses and datatypes.** A queued receive's `MPI_Status` exists only
+  once the stream has run, so it is kept by the layer and handed over when an
+  algorithm asks for the count, after waiting for the stream. Derived datatypes,
+  which some algorithms free right after the call, are duplicated for queued
+  operations until the end of the call.
+* **Not applicable on the queued path** (reported as `n/a`): barrier `linear`
+  (its `MPI_ANY_SOURCE` receive cannot match stream-queued messages). On
+  `cray` also bcast `scatter_allgather`, bcast `scatter_allgather_ring` and
+  scatter `binomial`, which need receive counts that Cray queues do not report.
+  `acx` and `cray` take `int` counts, so cases above `INT_MAX` elements are
+  skipped.
+* **Library-specific notes.**
+  * `cray`: `MPIX_Enqueue_start` triggers everything queued since the previous
+    start. collage starts lazily, just before the next wait, copy, kernel or
+    host wait, so all the messages of one algorithm step go out with one
+    trigger. `MPIX_Enqueue_wait` waits for everything started on a queue. One shared
+    queue would therefore make a wait cover operations that must stay
+    outstanding: a ring's send would also wait for the next step's
+    pre-posted receive, and the ring would deadlock. So every operation gets
+    its own queue from a pool. The pool grows to the largest number of
+    operations one call issues (e.g. 2(p−1) for a ring allreduce) and is
+    reused from call to call. The MPI requests are released at the end of each
+    call. Check that your system tolerates that many queues. HPE's man pages show
+    HIP streams and are inconsistent about `MPIX_Create_queue`'s arguments.
+    If yours differ, override them with
+    `-DCOLLAGE_CRAY_CREATE_QUEUE(s,q)=...` / `-DCOLLAGE_CRAY_FREE_QUEUE(q)=...`.
+  * `mpich`: MPICH needs a spare VCI for the stream
+    (`MPIR_CVAR_CH4_RESERVE_VCIS=1`). MPICH's own tests also use
+    `MPIR_CVAR_CH4_ENABLE_STREAM_WORKQ=1 MPIR_CVAR_GPU_HAS_WAIT_KERNEL=1` with
+    `--mpich-progress-thread`.
+  * `acx`: MPI-ACX is a prototype. Its README says it does not yet guarantee
+    MPI's non-overtaking order. Segmented algorithms send several messages
+    with the same tag to the same peer, so check with `--check` before trusting
+    timings. Build MPI-ACX with partitioned support, and give `CUDA_ARCH` the
+    architecture MPI-ACX was built for: its relocatable device code is
+    device-linked into collage.
+* **Native baseline.** `native` still calls the library's own CUDA-aware
+  collective from the host, so every figure compares queued algorithms with the
+  host-driven library collective and, via a second run with `--transport mpi`,
+  with the same algorithm host-driven. The CSV has a `transport` column (`mpi`,
+  `cray`, `mpich`, `acx`, or with `:all` for `--st-peers all`), and
+  `plots/plot_collage.py --kind transport` plots the speedup of each transport
+  over `mpi`.
 
 ## Reduction operations
 
@@ -348,54 +454,14 @@ sub-algorithms, so nothing reaches the MPI library's collectives:
 
 To use different sub-steps, change the corresponding line in the header.
 
-## Changes relative to the draft and to upstream
-
-The draft headers were partly copied Open MPI source (`MCA_PML_CALL`,
-`ompi_datatype_*`, `goto err_hndl`) and partly unfinished ports. `utils.hpp`
-was only present as a vim swap file. Everything was rewritten against the
-upstream sources at the commit above, keeping control flow and message
-schedules identical. These are the changes:
-
-* **Buffers are typed, counts are elements.** Every algorithm takes `T*`
-  buffers and `size_t` counts/displacements. The draft computed offsets as
-  `(T*)buf + i * count * sizeof(T)`, which scales by `sizeof(T)` twice. It also
-  had separate send/recv types `U`/`T`; one element type is used now.
-* **Packing and datatype copies became `memcpy`.** `opal_convertor_pack` (the
-  in-place alltoall(v)), `ompi_datatype_sndrcv` and
-  `ompi_datatype_copy_content_same_ddt` are equivalent to `memcpy` for
-  contiguous predefined types. Indexed datatypes are still built with
-  `MPI_Type_indexed(_c)` where upstream uses them (alltoall bruck, allgatherv
-  bruck / neighborexchange / basic_default, reduce_scatter_block
-  recursivedoubling).
-* **Persistent requests are freed.** Linear alltoall(v) now calls
-  `MPI_Request_free` on its persistent requests after `MPI_Waitall`. The draft
-  leaked them.
-* **Sparbit tags are non-negative.** Sparbit uses `TAG_BASE + block` instead of
-  upstream's negative internal tag space. At very large scale,
-  `1000 + size` must not exceed `MPI_TAG_UB`. MPI guarantees at least 32767,
-  and real implementations allow far more.
-* **Signed arithmetic in bcast scatter_allgather(_ring).** At this commit,
-  upstream uses `size_t` for `recv_count`/`send_count` and then tests
-  `<= 0` / `< 0`. That can underflow when blocks run past the end of the
-  buffer. The port uses signed 64-bit counts, which is what the code intends.
-* **Zero-size messages run the algorithm.** MPI libraries return early for
-  most collectives at count 0. Here, the 0-byte row runs each algorithm with
-  empty messages, which measures its latency term. Segmented algorithms use one
-  empty segment, and leaf processes in segmented reduce always send at least
-  one message, so the tree never deadlocks. The exceptions are algorithms
-  where upstream itself returns early for zero counts (`reduce_scatter_block`
-  and reduce_scatter `recursivehalving`).
-* **`TypeMap<long>` fixed.** The draft mapped `long` to `MPI_LONG_INT`, which
-  is a pair type. The type map now uses fixed-width `MPI_INT*_T`/`MPI_UINT*_T`.
-* **Errors abort, unsupported cases throw.** Errors go through `MPI_CHECK`,
-  which reports file and line and aborts. Algorithms that can't run in a given
-  configuration throw `NotApplicable`, and the harness reports `n/a`.
-
 ## Verification
 
 `--check` runs the native MPI collective once per size to build the
 reference. It then re-initialises the inputs, runs each algorithm once on
-poisoned output buffers, and compares the result element by element. 
+poisoned output buffers, and compares the result element by element. The
+comparison covers the root for rooted collectives and every rank otherwise.
+Inputs are small integers chosen per operation, so floating-point sums and
+products are exact whatever the reduction order.
 
 ## Cost model
 
@@ -405,11 +471,11 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Job and plotting scripts
+## Studies on Perlmutter
 
-`scripts/` holds batch job scripts for three studies on 16–128 CPU or GPU nodes:
+`scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and
-algorithm tunables (`tunables`). `scripts/plot_collage.py` turns their CSV
+algorithm tunables (`tunables`). `plots/plot_collage.py` turns their CSV
 output into figures. Build, submission and plotting are described in
 [scripts/README.md](perlmutter/README.md).
 

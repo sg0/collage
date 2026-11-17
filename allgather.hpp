@@ -67,7 +67,7 @@ public:
         T* tmpsend = tmprecv;
         if (comm_size == 1) return;
 
-        std::vector<MPI_Request> requests(comm_size, MPI_REQUEST_NULL);
+        std::vector<Request> requests(comm_size, REQUEST_NULL);
 
         /* calculate log2 of the total process count */
         comm_log = (int)std::ceil(std::log((double)comm_size) / std::log(2.0));
@@ -196,7 +196,7 @@ public:
         copy_elems(rbuf, sbuf, scount);
 
         max_reqs = 2 * (radix - 1);
-        std::vector<MPI_Request> reqs(max_reqs, MPI_REQUEST_NULL);
+        std::vector<Request> reqs(max_reqs, REQUEST_NULL);
         recvcount = 1;
         T* tmpsend = rbuf;
         for (distance = 1; distance < size; distance *= radix) {
@@ -234,7 +234,7 @@ public:
         copy_elems(rbuf + (size_t)rank * rcount, sbuf, scount);
         const T* tmpsend = sbuf;
 
-        std::vector<MPI_Request> reqs(2 * (size_t)(comm_size - 1) + 1, MPI_REQUEST_NULL);
+        std::vector<Request> reqs(2 * (size_t)(comm_size - 1) + 1, REQUEST_NULL);
         for (int i = 1; i < comm_size; ++i) {
             int peer_rank = (rank + i) % comm_size;
             T* tmprecv = rbuf + (size_t)peer_rank * rcount;

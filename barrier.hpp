@@ -104,7 +104,7 @@ public:
             send(nullptr, 0, MPI_BYTE, 0, TAG_BARRIER);
             recv(nullptr, 0, MPI_BYTE, 0, TAG_BARRIER);
         } else {
-            std::vector<MPI_Request> requests(size, MPI_REQUEST_NULL);
+            std::vector<Request> requests(size, REQUEST_NULL);
             for (int i = 1; i < size; ++i)
                 irecv(nullptr, 0, MPI_BYTE, MPI_ANY_SOURCE, TAG_BARRIER, &requests[i]);
             waitall(size - 1, requests.data() + 1);

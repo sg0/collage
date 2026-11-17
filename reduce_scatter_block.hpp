@@ -191,7 +191,7 @@ public:
                                                                                   : nprocs_rem + recv_index);
                 size_t sdispl = rcount * (size_t)((send_index <= nprocs_rem - 1) ? 2 * send_index
                                                                                   : nprocs_rem + send_index);
-                MPI_Request request = MPI_REQUEST_NULL;
+                Request request = REQUEST_NULL;
                 if (recv_count > 0)
                     irecv(tmprecv + rdispl, recv_count, dt_, peer, TAG_REDUCE_SCATTER_BLOCK, &request);
                 if (send_count > 0)

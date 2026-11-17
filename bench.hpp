@@ -78,6 +78,10 @@ struct Options {
     bool assume_cuda_aware = false;         /* skip the library's CUDA-awareness answer */
     std::vector<int> gpu_map;               /* --gpu-map: local rank -> device */
     std::vector<std::string> gpu_report;    /* header lines prepared by the driver */
+    std::string transport = "mpi";          /* --transport mpi | mpich | acx | cray */
+    bool st_all_peers = false;              /* --st-peers all: also queue on-node messages */
+    bool mpich_progress = false;            /* --mpich-progress-thread */
+    bool thread_multiple = false;           /* --thread-multiple (implied by stream transports) */
 };
 
 /* parameters handed to one algorithm variant */
@@ -1271,6 +1275,27 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             } else {
                 std::printf("# buffers      : host memory\n");
             }
+            {
+                int tl = MPI_THREAD_SINGLE;
+                MPI_Query_thread(&tl);
+                const char* tls = tl == MPI_THREAD_MULTIPLE ? "multiple" : tl == MPI_THREAD_SERIALIZED ? "serialized"
+                                  : tl == MPI_THREAD_FUNNELED ? "funneled" : "single";
+                if (o.transport == "mpi") {
+                    std::printf("# transport    : mpi (%s, host-driven; MPI thread level %s)\n",
+                                o.gpu ? "CUDA-aware MPI" : "MPI", tls);
+                } else {
+                    const char* what = o.transport == "mpich" ? "MPICH MPIX_Stream enqueue API"
+                                       : o.transport == "acx" ? "NVIDIA MPI-ACX enqueue API"
+                                                              : "Cray MPICH stream-triggered MPIX_Queue";
+                    std::printf("# transport    : %s (%s), stream-triggered, MPI thread level %s\n",
+                                o.transport.c_str(), what, tls);
+                    if (o.st_all_peers)
+                        std::printf("#                every message is queued on the CUDA stream (--st-peers all)\n");
+                    else
+                        std::printf("#                messages to other nodes are queued on the CUDA stream; on-node\n"
+                                    "#                messages use CUDA-aware MPI after the host waits for the stream\n");
+                }
+            }
             if (runner->reduction())
                 std::printf("# operation    : %s (%s)\n", op.name.c_str(), op.commute ? "commutative" : "non-commutative");
             if (o.coll == "bcast" || o.coll == "reduce" || o.coll == "gather" || o.coll == "scatter")
@@ -1302,15 +1327,16 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
 
             bool fits = runner->mem_bytes(n) <= o.max_mem;
             std::string skip_note = "exceeds --max-mem";
-#if !COLLAGE_LARGE_COUNT
-            /* MPI-3 library: a single count must fit in an int. Decide on a
-             * rank-independent bound so that every rank skips the same cases
-             * (a count error on some ranks only would deadlock the rest). */
-            if (fits && runner->mem_bytes(n) / sizeof(T) > (size_t)INT_MAX) {
+            /* MPI-3 library (or an int-count transport): a single count must fit
+             * in an int. Decide on a rank-independent bound so that every rank
+             * skips the same cases (a count error on some ranks only would
+             * deadlock the rest). */
+            if (fits && (!COLLAGE_LARGE_COUNT || !xport::large_count()) &&
+                runner->mem_bytes(n) / sizeof(T) > (size_t)INT_MAX) {
                 fits = false;
-                skip_note = "count may exceed INT_MAX (MPI library without MPI-4 large counts)";
+                skip_note = !COLLAGE_LARGE_COUNT ? "count may exceed INT_MAX (MPI library without MPI-4 large counts)"
+                                                 : "count may exceed INT_MAX (transport without large counts)";
             }
-#endif
             if (fits) {
                 runner->setup(n);
                 runner->upload();
@@ -1333,11 +1359,16 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     cell.note = fits ? "exceeds --max-mem" : skip_note;
                     continue;
                 }
+                /* with a stream-triggered transport the algorithm only queues work
+                 * on the CUDA stream; drain() waits for it (inside the timing) */
                 auto call = [&]() {
                     if (v.def) v.def->fn(v.params);
                     else runner->native();
+                    xport::drain();
                 };
                 try {
+                    if (v.def)
+                        if (const char* why = xport::unsupported(o.coll, v.base)) throw NotApplicable(why);
                     if (have_ref) {
                         runner->setup(n);
                         runner->stage(v.base);
@@ -1467,6 +1498,12 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::printf("# local reductions on rank 0: %zu kernel, %zu MPI_Reduce_local, %zu host-staged\n",
                             ms.reductions_kernel, ms.reductions_mpi, ms.reductions_staged);
             }
+            if (xport::streamed()) {
+                const xport::State& xs = xport::st();
+                std::printf("# messages on rank 0: %llu queued on the stream, %llu plain (on-node);"
+                            " %llu host waits for the stream before a plain call\n",
+                            xs.enqueued, xs.plain, xs.host_waits);
+            }
         }
 
         if (rank == 0 && !o.csv.empty()) {
@@ -1490,10 +1527,12 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 const int csv_ppn = per_node.empty() ? size : *std::max_element(per_node.begin(), per_node.end());
                 const std::string csv_buffers = o.gpu ? "gpu" : "host";
                 const std::string csv_reduce = o.gpu && runner->reduction() ? o.gpu_reduce : "-";
+                const std::string csv_transport =
+                    o.transport + (o.transport != "mpi" && o.st_all_peers ? ":all" : "");
                 std::string csv_tag = o.tag;
                 std::replace(csv_tag.begin(), csv_tag.end(), ',', ';');
                 std::fprintf(f, "collective,algorithm,variant,type,op,ranks,nodes,ranks_per_node,buffers,gpu_reduce,"
-                                "groups,group_ranks,layout,root,bytes,count,"
+                                "transport,groups,group_ranks,layout,root,bytes,count,"
                                 "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,tag,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
@@ -1515,10 +1554,10 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                             return q + "\"";
                         };
                         const std::string csv_variant = field(variants[vi].label), csv_layout = field(layout);
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s,%s\n",
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s,%s\n",
                                      o.coll.c_str(), variants[vi].base.c_str(), csv_variant.c_str(),
                                      type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, csv_nodes,
-                                     csv_ppn, csv_buffers.c_str(), csv_reduce.c_str(), groups, gsize, csv_layout.c_str(),
+                                     csv_ppn, csv_buffers.c_str(), csv_reduce.c_str(), csv_transport.c_str(), groups, gsize, csv_layout.c_str(),
                                      o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw, c.aggbw,
                                      csv_tag.c_str(), note.c_str());
                     }

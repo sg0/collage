@@ -60,6 +60,13 @@ struct NotApplicable : public std::runtime_error {
     explicit NotApplicable(const std::string& w) : std::runtime_error(w) {}
 };
 
+#include "transport.hpp"
+
+/* request handles held by the algorithms (see transport.hpp) */
+using Request = xport::Request;
+#define REQUEST_NULL (::xport::Request{})
+
+
 /* ------------------------------------------------------------------------- */
 /* tags (one communicator is dup'ed per collective object, so tags only need  */
 /* to be unique within an algorithm)                                          */
@@ -568,11 +575,13 @@ public:
         MPI_CHECK(MPI_Comm_dup(comm, &comm_));
         MPI_CHECK(MPI_Comm_size(comm_, &size_));
         MPI_CHECK(MPI_Comm_rank(comm_, &rank_));
+        ch_.open(comm_); /* collective: node locality, stream communicator */
     }
     virtual ~CollBase()
     {
         int finalized = 0;
         MPI_Finalized(&finalized);
+        ch_.close();
         if (!finalized && comm_ != MPI_COMM_NULL) MPI_Comm_free(&comm_);
     }
     CollBase(const CollBase&) = delete;
@@ -583,8 +592,11 @@ public:
     int size() const { return size_; }
 
 protected:
+    using Request = xport::Request;
+
     MPI_Comm comm_ = MPI_COMM_NULL;
     int rank_ = 0, size_ = 1;
+    xport::Channel ch_;
 
 #if COLLAGE_LARGE_COUNT
     static MPI_Count cnt(size_t c) { return (MPI_Count)c; }
@@ -598,18 +610,37 @@ protected:
     }
 #endif
 
-    /* the MCA_PML_CALL(...) equivalents */
+        /* --------------------------------------------------------------------
+     * Point-to-point wrappers: the MCA_PML_CALL(...) equivalents.
+     * Every message goes through the transport layer (transport.hpp): plain
+     * (CUDA-aware) MPI by default; with a stream-triggered transport,
+     * messages to peers on other nodes are queued on the CUDA stream and the
+     * others stay on the plain path, after the host waits for the stream.
+     * -------------------------------------------------------------------- */
     void send(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag) const
     {
+        if (ch_.enq(dest)) {
+            Request r;
+            xport::enq_isend(ch_, buf, count, dt, dest, tag, &r);
+            xport::enq_wait(&r, MPI_STATUS_IGNORE);
+            return;
+        }
+        xport::before_plain();
 #if COLLAGE_LARGE_COUNT
         MPI_CHECK(MPI_Send_c(buf, cnt(count), dt, dest, tag, comm_));
 #else
         MPI_CHECK(MPI_Send(buf, cnt(count), dt, dest, tag, comm_));
 #endif
     }
-    /* MCA_PML_BASE_SEND_SYNCHRONOUS */
+    /* MCA_PML_BASE_SEND_SYNCHRONOUS (a standard send on the stream path:
+     * the enqueue APIs have no synchronous mode) */
     void ssend(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag) const
     {
+        if (ch_.enq(dest)) {
+            send(buf, count, dt, dest, tag);
+            return;
+        }
+        xport::before_plain();
 #if COLLAGE_LARGE_COUNT
         MPI_CHECK(MPI_Ssend_c(buf, cnt(count), dt, dest, tag, comm_));
 #else
@@ -619,6 +650,14 @@ protected:
     void recv(void* buf, size_t count, MPI_Datatype dt, int src, int tag,
               MPI_Status* st = MPI_STATUS_IGNORE) const
     {
+        if (ch_.enq(src)) {
+            Request r;
+            xport::enq_irecv(ch_, buf, count, dt, src, tag, &r);
+            xport::enq_wait(&r, st);
+            return;
+        }
+        xport::before_plain();
+        xport::forget_status(st);
 #if COLLAGE_LARGE_COUNT
         MPI_CHECK(MPI_Recv_c(buf, cnt(count), dt, src, tag, comm_, st));
 #else
@@ -626,55 +665,210 @@ protected:
 #endif
     }
     void isend(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag,
-               MPI_Request* req) const
+               Request* req) const
     {
+        if (ch_.enq(dest)) {
+            xport::enq_isend(ch_, buf, count, dt, dest, tag, req);
+            return;
+        }
+        xport::before_plain();
+        *req = Request{};
+        req->k = Request::Host;
 #if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Isend_c(buf, cnt(count), dt, dest, tag, comm_, req));
+        MPI_CHECK(MPI_Isend_c(buf, cnt(count), dt, dest, tag, comm_, &req->h));
 #else
-        MPI_CHECK(MPI_Isend(buf, cnt(count), dt, dest, tag, comm_, req));
+        MPI_CHECK(MPI_Isend(buf, cnt(count), dt, dest, tag, comm_, &req->h));
+#endif
+    }
+    /* synchronous-mode isend (reduce flow control); standard on the stream path */
+    void issend(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag,
+                Request* req) const
+    {
+        if (ch_.enq(dest)) {
+            xport::enq_isend(ch_, buf, count, dt, dest, tag, req);
+            return;
+        }
+        xport::before_plain();
+        *req = Request{};
+        req->k = Request::Host;
+#if COLLAGE_LARGE_COUNT
+        MPI_CHECK(MPI_Issend_c(buf, cnt(count), dt, dest, tag, comm_, &req->h));
+#else
+        MPI_CHECK(MPI_Issend(buf, cnt(count), dt, dest, tag, comm_, &req->h));
 #endif
     }
     void irecv(void* buf, size_t count, MPI_Datatype dt, int src, int tag,
-               MPI_Request* req) const
+               Request* req) const
     {
+        if (ch_.enq(src)) {
+            xport::enq_irecv(ch_, buf, count, dt, src, tag, req);
+            return;
+        }
+        xport::before_plain();
+        *req = Request{};
+        req->k = Request::Host;
 #if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Irecv_c(buf, cnt(count), dt, src, tag, comm_, req));
+        MPI_CHECK(MPI_Irecv_c(buf, cnt(count), dt, src, tag, comm_, &req->h));
 #else
-        MPI_CHECK(MPI_Irecv(buf, cnt(count), dt, src, tag, comm_, req));
+        MPI_CHECK(MPI_Irecv(buf, cnt(count), dt, src, tag, comm_, &req->h));
 #endif
     }
+    /* persistent requests: real ones on the plain transport; in stream mode a
+     * descriptor that startall() turns into isend/irecv on the right path */
     void send_init(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag,
-                   MPI_Request* req) const
+                   Request* req) const
     {
+        *req = Request{};
+        if (xport::streamed()) {
+            req->k = Request::Pers;
+            req->p = new xport::Persist{true, buf, count, dt, dest, tag, Request{}};
+            return;
+        }
+        req->k = Request::Host;
 #if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Send_init_c(buf, cnt(count), dt, dest, tag, comm_, req));
+        MPI_CHECK(MPI_Send_init_c(buf, cnt(count), dt, dest, tag, comm_, &req->h));
 #else
-        MPI_CHECK(MPI_Send_init(buf, cnt(count), dt, dest, tag, comm_, req));
+        MPI_CHECK(MPI_Send_init(buf, cnt(count), dt, dest, tag, comm_, &req->h));
 #endif
     }
     void recv_init(void* buf, size_t count, MPI_Datatype dt, int src, int tag,
-                   MPI_Request* req) const
+                   Request* req) const
     {
+        *req = Request{};
+        if (xport::streamed()) {
+            req->k = Request::Pers;
+            req->p = new xport::Persist{false, buf, count, dt, src, tag, Request{}};
+            return;
+        }
+        req->k = Request::Host;
 #if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Recv_init_c(buf, cnt(count), dt, src, tag, comm_, req));
+        MPI_CHECK(MPI_Recv_init_c(buf, cnt(count), dt, src, tag, comm_, &req->h));
 #else
-        MPI_CHECK(MPI_Recv_init(buf, cnt(count), dt, src, tag, comm_, req));
+        MPI_CHECK(MPI_Recv_init(buf, cnt(count), dt, src, tag, comm_, &req->h));
 #endif
     }
-    static void wait(MPI_Request* req, MPI_Status* st = MPI_STATUS_IGNORE)
+    void startall(int n, Request* reqs) const
     {
-        MPI_CHECK(MPI_Wait(req, st));
+        std::vector<MPI_Request> h;
+        for (int i = 0; i < n; ++i) {
+            Request& r = reqs[i];
+            if (r.k == Request::Pers) {
+                xport::Persist& p = *r.p;
+                if (p.is_send) isend(p.buf, p.count, p.dt, p.peer, p.tag, &p.active);
+                else irecv(const_cast<void*>(p.buf), p.count, p.dt, p.peer, p.tag, &p.active);
+            } else if (r.k == Request::Host) {
+                h.push_back(r.h);
+            }
+        }
+        if (!h.empty()) {
+            xport::before_plain();
+            MPI_CHECK(MPI_Startall((int)h.size(), h.data()));
+        }
     }
-    static void waitall(int n, MPI_Request* reqs)
+    static void request_free(Request* r)
     {
-        if (n > 0) MPI_CHECK(MPI_Waitall(n, reqs, MPI_STATUSES_IGNORE));
+        if (r->k == Request::Pers) delete r->p;
+        else if (r->k == Request::Host && r->h != MPI_REQUEST_NULL) MPI_Request_free(&r->h);
+        *r = Request{};
     }
-    static void waitany(int n, MPI_Request* reqs, int* idx)
+    static void wait(Request* req, MPI_Status* st = MPI_STATUS_IGNORE)
     {
-        MPI_CHECK(MPI_Waitany(n, reqs, idx, MPI_STATUS_IGNORE));
+        switch (req->k) {
+            case Request::None:
+                return;
+            case Request::Done:
+                *req = Request{};
+                return;
+            case Request::Host:
+                xport::forget_status(st);
+                MPI_CHECK(MPI_Wait(&req->h, st));
+                if (req->h == MPI_REQUEST_NULL) *req = Request{}; /* persistent ones stay */
+                return;
+            case Request::Enq:
+                xport::enq_wait(req, st);
+                return;
+            case Request::Pers:
+                wait(&req->p->active, st);
+                return;
+        }
+    }
+    static void waitall(int n, Request* reqs)
+    {
+        if (n <= 0) return;
+        std::vector<Request*> enq;
+        std::vector<int> host;
+        std::vector<MPI_Request> h;
+        for (int i = 0; i < n; ++i) {
+            Request* r = &reqs[i];
+            if (r->k == Request::Pers) r = &r->p->active;
+            if (r->k == Request::Done) *r = Request{};
+            else if (r->k == Request::Enq) enq.push_back(r);
+            else if (r->k == Request::Host) {
+                host.push_back(i);
+                h.push_back(r->h);
+            }
+        }
+        /* the stream waits first (does not block the host), then the host waits */
+        xport::enq_waitall((int)enq.size(), enq.data());
+        if (!h.empty()) {
+            MPI_CHECK(MPI_Waitall((int)h.size(), h.data(), MPI_STATUSES_IGNORE));
+            for (size_t j = 0; j < host.size(); ++j) {
+                Request* r = &reqs[host[j]];
+                if (r->k == Request::Pers) r = &r->p->active;
+                r->h = h[j];
+                if (r->h == MPI_REQUEST_NULL) *r = Request{};
+            }
+        }
+    }
+    /* MPI_Waitany; in stream mode: the first active request (a legal outcome) */
+    static void waitany(int n, Request* reqs, int* idx)
+    {
+        *idx = MPI_UNDEFINED;
+        if (!xport::streamed()) {
+            std::vector<MPI_Request> h((size_t)n, MPI_REQUEST_NULL);
+            for (int i = 0; i < n; ++i)
+                if (reqs[i].k == Request::Host) h[(size_t)i] = reqs[i].h;
+            MPI_CHECK(MPI_Waitany(n, h.data(), idx, MPI_STATUS_IGNORE));
+            if (*idx != MPI_UNDEFINED) {
+                reqs[*idx].h = h[(size_t)*idx];
+                if (reqs[*idx].h == MPI_REQUEST_NULL) reqs[*idx] = Request{};
+            }
+            return;
+        }
+        /* Stream mode: the host cannot observe which queued operation
+         * completes first. Wait for every active request (the stream waits
+         * for the queued ones), then report the completed ones one per call;
+         * waiting for one particular request instead could deadlock (alltoall
+         * linear_sync: every rank would wait for a receive whose sender is
+         * itself waiting for a receive). */
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int i = 0; i < n; ++i)
+                if (reqs[i].k == Request::Done) {
+                    reqs[i] = Request{};
+                    *idx = i;
+                    return;
+                }
+            if (pass) return;
+            std::vector<int> act;
+            for (int i = 0; i < n; ++i) {
+                Request* r = &reqs[i];
+                if (r->k == Request::Pers) r = &r->p->active;
+                if (r->k != Request::None) act.push_back(i);
+            }
+            if (act.empty()) return;
+            std::vector<Request> tmp;
+            for (int i : act) tmp.push_back(reqs[i]);
+            waitall((int)tmp.size(), tmp.data());
+            for (int i : act) {
+                if (reqs[i].k == Request::Pers) reqs[i].p->active = Request{};
+                else reqs[i] = Request{};
+                reqs[i].k = reqs[i].k == Request::Pers ? Request::Pers : Request::Done;
+            }
+        }
     }
     static size_t get_count(MPI_Status* st, MPI_Datatype dt)
     {
+        xport::fetch_status(st); /* stream path: wait for the stream, copy the status */
 #if COLLAGE_LARGE_COUNT
         MPI_Count c = 0;
         MPI_CHECK(MPI_Get_count_c(st, dt, &c));
@@ -690,7 +884,7 @@ protected:
                          void* rbuf, size_t rcount, MPI_Datatype rdt, int source, int rtag,
                          MPI_Status* st = MPI_STATUS_IGNORE) const
     {
-        MPI_Request req = MPI_REQUEST_NULL;
+        Request req;
         irecv(rbuf, rcount, rdt, source, rtag, &req);
         send(sbuf, scount, sdt, dest, stag);
         wait(&req, st);
@@ -715,7 +909,7 @@ protected:
     /* ompi_coll_base_sendrecv_zero (barrier helper) */
     void sendrecv_zero(int dest, int stag, int source, int rtag) const
     {
-        MPI_Request req = MPI_REQUEST_NULL;
+        Request req;
         irecv(nullptr, 0, MPI_BYTE, source, rtag, &req);
         send(nullptr, 0, MPI_BYTE, dest, stag);
         wait(&req);

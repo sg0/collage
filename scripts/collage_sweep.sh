@@ -38,6 +38,8 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"            # passed to collage verbatim (e.g. "-s 0
 DRYRUN="${DRYRUN:-0}"
 FORCE="${FORCE:-0}"
 STUDY="${STUDY:-algos}"
+TRANSPORTS="${TRANSPORTS:-mpi}"         # GPU buffers: mpi | cray | mpich | acx (stream-triggered ones
+                                        # need a binary built with ST=..., see build_perlmutter.sh)
 OUTDIR="${OUTDIR:-${SCRATCH:-$PWD}/collage_study/${STUDY}/${NODE_TYPE}_${NODES}N}"
 NODE_MEM_GB="${NODE_MEM_GB:?set NODE_MEM_GB (host memory per node)}"
 MEM_FRACTION_PCT="${MEM_FRACTION_PCT:-50}"   # share of node memory for benchmark buffers
@@ -126,10 +128,15 @@ collage_sweep() {
                 for op in $ops; do
                 for buffers in $buffers_list; do
                     local reds="-"; [ "$buffers" = gpu ] && [ "$op" != "-" ] && reds=$reduce_list
-                    for red in $reds; do
+                    local trs=mpi; [ "$buffers" = gpu ] && trs=$TRANSPORTS
+                    local combos="" r t
+                    for r in $reds; do for t in $trs; do combos="$combos $r/$t"; done; done
+                    for combo in $combos; do
+                        local red=${combo%/*} tr=${combo#*/}
                         planned=$((planned + 1))
                         local name="${coll}__${buffers}__ppn${ppn}__${layout//:/-}__${type}__${op}"
                         [ "$red" != "-" ] && name="${name}__${red}"
+                        [ "$tr" != mpi ] && name="${name}__st-${tr}"
                         local csv="$OUTDIR/raw/${name}.csv" lg="$OUTDIR/logs/${name}.log"
                         if [ "$FORCE" != 1 ] && [ -s "$csv" ]; then skipped=$((skipped + 1)); continue; fi
 
@@ -146,6 +153,7 @@ collage_sweep() {
                         if [ "$buffers" = gpu ]; then
                             args+=(--gpu ${GPU_MAP:+--gpu-map "$GPU_MAP"})
                             [ "$red" != "-" ] && args+=(--gpu-reduce "$red")
+                            [ "$tr" != mpi ] && args+=(--transport "$tr")
                         fi
                         # shellcheck disable=SC2206
                         args+=($EXTRA_ARGS)

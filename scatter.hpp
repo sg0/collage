@@ -107,8 +107,8 @@ public:
         } else {
             nreqs = size - (size / max_reqs);
         }
-        std::vector<MPI_Request> reqs(std::max(nreqs, 1), MPI_REQUEST_NULL);
-        MPI_Request* preq = reqs.data();
+        std::vector<Request> reqs(std::max(nreqs, 1), REQUEST_NULL);
+        Request* preq = reqs.data();
 
         const T* ptmp = sbuf;
         for (i = 0; i < size; ++i, ptmp += scount) {
@@ -132,14 +132,14 @@ public:
             if (rcount > 0) recv(rbuf, rcount, dt_, root, TAG_SCATTERV);
             return;
         }
-        std::vector<MPI_Request> reqs;
+        std::vector<Request> reqs;
         reqs.reserve(size);
         for (int i = 0; i < size; ++i) {
             const T* ptmp = sbuf + displs[i];
             if (i == rank) {
                 if (rbuf != ptmp) copy_elems(rbuf, ptmp, std::min(scounts[i], rcount));
             } else if (scounts[i] > 0) {
-                reqs.emplace_back(MPI_REQUEST_NULL);
+                reqs.emplace_back(REQUEST_NULL);
                 isend(ptmp, scounts[i], dt_, i, TAG_SCATTERV, &reqs.back());
             }
         }

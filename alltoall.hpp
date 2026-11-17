@@ -19,7 +19,7 @@ public:
     void inplace(T* rbuf, size_t rcount)
     {
         int i, left, right;
-        MPI_Request req = MPI_REQUEST_NULL;
+        Request req = REQUEST_NULL;
         const int size = size_, rank = rank_;
 
         if ((1 == size) || (0 == rcount)) return;
@@ -129,7 +129,7 @@ public:
         total_reqs = (((max_outstanding_reqs > (size - 1)) || (max_outstanding_reqs <= 0))
                           ? (size - 1)
                           : (max_outstanding_reqs));
-        std::vector<MPI_Request> reqs(2 * (size_t)total_reqs, MPI_REQUEST_NULL);
+        std::vector<Request> reqs(2 * (size_t)total_reqs, REQUEST_NULL);
 
         /* Post first batch of irecv and isend requests  */
         for (nreqs = 0, nrreqs = 0, ri = (rank + 1) % size; nreqs < total_reqs;
@@ -150,7 +150,7 @@ public:
             while (ncreqs < 2 * (size - 1)) {
                 int completed;
                 waitany(2 * total_reqs, reqs.data(), &completed);
-                reqs[completed] = MPI_REQUEST_NULL;
+                reqs[completed] = REQUEST_NULL;
                 ncreqs++;
                 if (completed < total_reqs) {
                     if (nrreqs < (size - 1)) {
@@ -190,8 +190,8 @@ public:
         copy_elems(rbuf + (size_t)rank * rcount, sbuf + (size_t)rank * scount, scount);
         if (1 == size) return;
 
-        std::vector<MPI_Request> req(2 * (size_t)(size - 1), MPI_REQUEST_NULL);
-        MPI_Request* rreq = req.data();
+        std::vector<Request> req(2 * (size_t)(size - 1), REQUEST_NULL);
+        Request* rreq = req.data();
 
         /* Post all receives first -- a simple optimization */
         for (nreqs = 0, i = (rank + 1) % size; i != rank; i = (i + 1) % size, ++rreq) {
@@ -199,15 +199,15 @@ public:
             recv_init(rbuf + (size_t)i * rcount, rcount, dt_, i, TAG_ALLTOALL, rreq);
         }
         /* Now post all sends in reverse order */
-        MPI_Request* sreq = rreq;
+        Request* sreq = rreq;
         for (i = (rank + size - 1) % size; i != rank; i = (i + size - 1) % size, ++sreq) {
             nreqs++;
             send_init(sbuf + (size_t)i * scount, scount, dt_, i, TAG_ALLTOALL, sreq);
         }
 
-        MPI_CHECK(MPI_Startall(nreqs, req.data()));
+        startall(nreqs, req.data());
         waitall(nreqs, req.data());
-        for (i = 0; i < nreqs; ++i) MPI_Request_free(&req[i]);
+        for (i = 0; i < nreqs; ++i) request_free(&req[i]);
     }
 
 private:

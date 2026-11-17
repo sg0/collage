@@ -138,7 +138,22 @@ void usage()
         "      --assume-cuda-aware  run even if the MPI library does not report CUDA\n"
         "                         awareness (for libraries that cannot be queried)\n"
         "      --gpu-map LIST     device of each local rank, map[local rank %% size],\n"
-        "                         e.g. 3,2,1,0 (default: local rank %% visible GPUs)\n");
+        "                         e.g. 3,2,1,0 (default: local rank %% visible GPUs)\n"
+        "\n"
+        "Transport of the algorithms' messages (see transport.hpp; with --gpu only)\n"
+        "      --transport T      mpi (default): CUDA-aware MPI, host-driven\n"
+        "                         mpich: MPICH MPIX_Stream enqueue API (build ST=mpich)\n"
+        "                         acx: NVIDIA MPI-ACX enqueue API (build ST=acx)\n"
+        "                         cray: Cray MPICH stream-triggered MPIX_Queue (build ST=cray)\n"
+        "                         Stream-triggered transports queue sends, receives,\n"
+        "                         waits, copies and reduction kernels on the CUDA stream;\n"
+        "                         they need MPI_THREAD_MULTIPLE (requested automatically)\n"
+        "      --st-peers P       inter (default): queue only messages to other nodes,\n"
+        "                         on-node ones use CUDA-aware MPI | all: queue every message\n"
+        "      --mpich-progress-thread  start MPICH's stream progress thread\n"
+        "                         (MPIX_Start_progress_thread; transport mpich)\n"
+        "      --thread-multiple  initialise MPI with MPI_THREAD_MULTIPLE for the plain\n"
+        "                         transport too (same thread level as the stream ones)\n");
 }
 
 /* --split-mask M        groups of M consecutive ranks
@@ -247,6 +262,19 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         }
         else if (a == "--csv") o.csv = v();
         else if (a == "--tag") o.tag = v();
+        else if (a == "--transport") {
+            o.transport = v();
+            xport::Kind k;
+            if (!xport::parse_kind(o.transport, k))
+                throw std::invalid_argument("--transport must be mpi, mpich, acx or cray");
+        }
+        else if (a == "--st-peers") {
+            std::string p = v();
+            if (p != "inter" && p != "all") throw std::invalid_argument("--st-peers must be inter or all");
+            o.st_all_peers = (p == "all");
+        }
+        else if (a == "--mpich-progress-thread") o.mpich_progress = true;
+        else if (a == "--thread-multiple") o.thread_multiple = true;
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
@@ -459,7 +487,17 @@ int main(int argc, char** argv)
         }
     }
 #endif
-    MPI_Init(&argc, &argv);
+    /* stream-triggered transports call MPI from library threads (MPI-ACX proxy,
+     * MPICH GPU host functions / progress thread): MPI_THREAD_MULTIPLE */
+    const std::string want_transport = argv_value(argc, argv, "--transport");
+    const bool want_multiple = (!want_transport.empty() && want_transport != "mpi") ||
+                               argv_has(argc, argv, "--thread-multiple");
+    if (want_multiple) {
+        int provided = MPI_THREAD_SINGLE;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    } else {
+        MPI_Init(&argc, &argv);
+    }
     int rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     int rc = 0;
@@ -474,6 +512,30 @@ int main(int argc, char** argv)
             throw std::invalid_argument("--gpu: this binary was built without CUDA support (rebuild with `make CUDA=1`)");
 #endif
         }
+        if (!help && !list) {
+            if (o.thread_multiple || o.transport != "mpi") {
+                int provided = MPI_THREAD_SINGLE;
+                MPI_Query_thread(&provided);
+                if (provided < MPI_THREAD_MULTIPLE)
+                    throw std::runtime_error("MPI_THREAD_MULTIPLE requested but the MPI library provides only "
+                                             "thread level " + std::to_string(provided));
+            }
+            if (o.transport != "mpi") {
+                if (!o.gpu) throw std::invalid_argument("--transport " + o.transport + " needs --gpu");
+                xport::Kind k = xport::Kind::Mpi;
+                xport::parse_kind(o.transport, k);
+                /* every rank must succeed, or all stop together */
+                std::string err;
+                try { xport::configure(k, o.st_all_peers, o.mpich_progress); } catch (const std::exception& e) { err = e.what(); }
+                int bad = err.empty() ? 0 : 1, first_bad = bad ? rank : INT_MAX;
+                MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+                MPI_Allreduce(MPI_IN_PLACE, &first_bad, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+                if (bad) {
+                    if (rank == first_bad) std::fprintf(stderr, "collage: rank %d: %s\n", rank, err.c_str());
+                    throw std::runtime_error("--transport " + o.transport + ": setup failed (see the message above)");
+                }
+            }
+        }
         if (help) {
             if (rank == 0) usage();
         } else if (list) {
@@ -486,7 +548,8 @@ int main(int argc, char** argv)
         if (rank == 0) std::fprintf(stderr, "collage: %s\n", e.what());
         rc = 1;
     }
-    mem::shutdown(); /* cached device memory, staging buffers, stream */
+    xport::shutdown(); /* MPICH stream, MPI-ACX, Cray queue (before the CUDA stream goes) */
+    mem::shutdown();   /* cached device memory, staging buffers, stream */
     MPI_Finalize();
     return rc;
 }

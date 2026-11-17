@@ -96,15 +96,15 @@ public:
             send(sbuf, first_segment_count, dt_, root, TAG_GATHER);
             send(sbuf + first_segment_count, scount - first_segment_count, dt_, root, TAG_GATHER);
         } else {
-            std::vector<MPI_Request> reqs(size, MPI_REQUEST_NULL);
-            MPI_Request first_segment_req;
+            std::vector<Request> reqs(size, REQUEST_NULL);
+            Request first_segment_req;
 
             first_segment_count = rcount;
             computed_segcount(first_segment_size, sizeof(T), first_segment_count);
 
             for (i = 0; i < size; ++i) {
                 if (i == rank) {
-                    reqs[i] = MPI_REQUEST_NULL;
+                    reqs[i] = REQUEST_NULL;
                     continue;
                 }
                 /* irecv for the first segment from i */
@@ -151,14 +151,14 @@ public:
             if (scount > 0) send(sbuf, scount, dt_, root, TAG_GATHERV);
             return;
         }
-        std::vector<MPI_Request> reqs;
+        std::vector<Request> reqs;
         reqs.reserve(size);
         for (int i = 0; i < size; ++i) {
             T* ptmp = rbuf + displs[i];
             if (i == rank) {
                 copy_elems(ptmp, sbuf, std::min(scount, rcounts[i]));
             } else if (rcounts[i] > 0) {
-                reqs.emplace_back(MPI_REQUEST_NULL);
+                reqs.emplace_back(REQUEST_NULL);
                 irecv(ptmp, rcounts[i], dt_, i, TAG_GATHERV, &reqs.back());
             }
         }

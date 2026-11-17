@@ -26,7 +26,7 @@ public:
         T* accumbuf = nullptr;
         const T* local_op_buffer = nullptr;
         const T* sendtmpbuf = sendbuf;
-        MPI_Request reqs[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+        Request reqs[2] = {REQUEST_NULL, REQUEST_NULL};
         int num_segments, segindex, i, inbi;
         size_t recvcount, prevcount;
         const int rank = rank_;
@@ -126,7 +126,7 @@ public:
             } else {
                 /* flow control: max_outstanding_reqs non-blocking synchronous sends */
                 int creq = 0;
-                std::vector<MPI_Request> sreq(max_outstanding_reqs, MPI_REQUEST_NULL);
+                std::vector<Request> sreq(max_outstanding_reqs, REQUEST_NULL);
                 for (segindex = 0; segindex < max_outstanding_reqs; segindex++) {
                     issend(sendbuf + (size_t)segindex * segment_increment, count_by_segment,
                            tree.tree_prev, &sreq[segindex]);
@@ -394,10 +394,10 @@ public:
         copy_elems(reduce_buf.data(), sendbuf, count);
 
         int num_reqs = 0;
-        std::vector<MPI_Request> reqs;
+        std::vector<Request> reqs;
         if (!is_leaf) {
             child_buf.resize(count * (size_t)num_children);
-            reqs.assign(num_children, MPI_REQUEST_NULL);
+            reqs.assign(num_children, REQUEST_NULL);
         }
         for (int i = 0; i < num_children; i++) {
             int child = tree.tree_next[i];
@@ -416,13 +416,9 @@ public:
 private:
     MPI_Datatype dt_;
 
-    void issend(const T* buf, size_t count, int dest, MPI_Request* req) const
+    void issend(const T* buf, size_t count, int dest, Request* req) const
     {
-#if COLLAGE_LARGE_COUNT
-        MPI_CHECK(MPI_Issend_c(buf, cnt(count), dt_, dest, TAG_REDUCE, comm_, req));
-#else
-        MPI_CHECK(MPI_Issend(buf, cnt(count), dt_, dest, TAG_REDUCE, comm_, req));
-#endif
+        CollBase::issend(buf, count, dt_, dest, TAG_REDUCE, req);
     }
     static void require_commutative(MPI_Op op, const char* algo)
     {

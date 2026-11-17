@@ -101,7 +101,7 @@ public:
             while (mask > 0) {
                 int tmp_peer, peer;
                 size_t send_count, recv_count;
-                MPI_Request request = MPI_REQUEST_NULL;
+                Request request = REQUEST_NULL;
 
                 tmp_peer = tmp_rank ^ mask;
                 peer = (tmp_peer < remain) ? tmp_peer * 2 + 1 : tmp_peer + remain;
@@ -154,7 +154,7 @@ public:
         int i, k, recv_from, send_to, inbi;
         const int size = size_, rank = rank_;
         size_t total_count, max_block_count;
-        MPI_Request reqs[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+        Request reqs[2] = {REQUEST_NULL, REQUEST_NULL};
 
         std::vector<size_t> displs(size);
         displs[0] = 0;

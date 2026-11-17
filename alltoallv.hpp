@@ -23,7 +23,7 @@ public:
     {
         int i, left, right;
         const int size = size_, rank = rank_;
-        MPI_Request req = MPI_REQUEST_NULL;
+        Request req = REQUEST_NULL;
         size_t max_size = 0;
 
         for (i = 0; i < size; ++i) {
@@ -68,10 +68,10 @@ public:
     {
         int step, sendto, recvfrom;
         const int size = size_, rank = rank_;
-        MPI_Request req;
+        Request req;
 
         for (step = 0; step < size; step++) {
-            req = MPI_REQUEST_NULL;
+            req = REQUEST_NULL;
             sendto = (rank + step) % size;
             recvfrom = (rank + size - step) % size;
 
@@ -82,7 +82,7 @@ public:
                 irecv(prcv, rcounts[recvfrom], dt_, recvfrom, TAG_ALLTOALLV, &req);
             if (0 < scounts[sendto])
                 send(psnd, scounts[sendto], dt_, sendto, TAG_ALLTOALLV);
-            if (MPI_REQUEST_NULL != req) wait(&req);
+            if (REQUEST_NULL != req) wait(&req);
         }
     }
 
@@ -100,8 +100,8 @@ public:
         if (1 == size) return;
 
         nreqs = 0;
-        std::vector<MPI_Request> reqs(2 * (size_t)size, MPI_REQUEST_NULL);
-        MPI_Request* preq = reqs.data();
+        std::vector<Request> reqs(2 * (size_t)size, REQUEST_NULL);
+        Request* preq = reqs.data();
 
         /* Post all receives first */
         for (i = 0; i < size; ++i) {
@@ -121,10 +121,10 @@ public:
         }
 
         if (nreqs > 0) {
-            MPI_CHECK(MPI_Startall(nreqs, reqs.data()));
+            startall(nreqs, reqs.data());
             waitall(nreqs, reqs.data());
             /* Free the requests in all cases as they are persistent */
-            for (i = 0; i < nreqs; ++i) MPI_Request_free(&reqs[i]);
+            for (i = 0; i < nreqs; ++i) request_free(&reqs[i]);
         }
     }
 

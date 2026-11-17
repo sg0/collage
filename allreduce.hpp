@@ -102,7 +102,7 @@ public:
         size_t early_segcount, late_segcount, split_rank, max_segcount, block_count;
         size_t block_offset;
         const int size = size_, rank = rank_;
-        MPI_Request reqs[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+        Request reqs[2] = {REQUEST_NULL, REQUEST_NULL};
 
         if (1 == size) {
             copy_elems(rbuf, sbuf, count);
@@ -181,7 +181,7 @@ public:
         int k, recv_from, send_to, num_phases, phase;
         size_t early_blockcount, late_blockcount, split_rank, segcount, max_segcount, tmp1, tmp2;
         const int size = size_, rank = rank_;
-        MPI_Request reqs[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+        Request reqs[2] = {REQUEST_NULL, REQUEST_NULL};
 
         if (1 == size) {
             copy_elems(rbuf, sbuf, count);
