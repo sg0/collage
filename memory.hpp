@@ -46,9 +46,10 @@
 #include <utility>
 #include <vector>
 
+#include "gpu_ops.hpp" /* operator table, also for the low-precision op registry */
+
 #if defined(COLLAGE_CUDA)
 #include <cuda_runtime.h>
-#include "gpu_ops.hpp"
 #define CUDA_CHECK(call)                                                                       \
     do {                                                                                       \
         cudaError_t _e = (call);                                                               \
@@ -95,6 +96,15 @@ struct State {
     void (*raw_free)(void*) = nullptr;
     /* statistics, for the run header / debugging */
     size_t reductions_kernel = 0, reductions_mpi = 0, reductions_staged = 0;
+    /* user-defined MPI ops that have a device reduction (see register_device_op) */
+    struct DeviceOp {
+        MPI_Op op;
+        collage_gpu::DType type; /* built-in kernel (fn == nullptr) */
+        collage_gpu::OpCode code;
+        int (*fn)(const void* in, void* inout, size_t count, MPI_Datatype dt, void* stream, void* ctx);
+        void* ctx;
+    };
+    std::vector<DeviceOp> device_ops;
 };
 
 inline State& st()
@@ -375,6 +385,50 @@ inline collage_gpu::DType dtype_code(MPI_Datatype dt)
 }
 #endif
 
+/* ------------------------------------------------------------------------- */
+/* device reductions for user-defined MPI ops                                 */
+/* ------------------------------------------------------------------------- */
+/* MPI only knows a user op's host function, and a host function cannot touch
+ * device memory, so user ops are reduced through pinned host memory unless
+ * they are registered here with a device implementation. Then every local
+ * reduction step of every algorithm on GPU data (--gpu-reduce kernel) runs it
+ * on collage's stream instead; MPI (the native baseline, --gpu-reduce
+ * mpi|host) still uses the host function.
+ *
+ *   fn(in, inout, count, dt, stream, ctx): queue inout = in (op) inout on
+ *   `stream` (a cudaStream_t) without synchronising, and return 0; any other
+ *   value falls back to the host function for that call.
+ *
+ * Library users: create the op with MPI_Op_create as usual, then
+ *   mem::register_device_op(op, fn, ctx);   ...   mem::unregister_device_op(op);
+ * The benchmark registers its own ops (low-precision types, user, user_nc)
+ * with built-in kernels, and plugin ops (-o plugin:PATH) with theirs. */
+using DeviceReduceFn = int (*)(const void* in, void* inout, size_t count, MPI_Datatype dt, void* stream, void* ctx);
+
+inline void unregister_device_op(MPI_Op op)
+{
+    auto& v = st().device_ops;
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].op == op) { v.erase(v.begin() + (long)i); return; }
+}
+inline void register_device_op(MPI_Op op, DeviceReduceFn fn, void* ctx = nullptr)
+{
+    unregister_device_op(op);
+    st().device_ops.push_back(State::DeviceOp{op, collage_gpu::DType::Unknown, collage_gpu::OpCode::Unknown, fn, ctx});
+}
+/* a user op that computes a built-in operator of gpu_ops.hpp */
+inline void register_builtin_device_op(MPI_Op op, collage_gpu::DType t, collage_gpu::OpCode c)
+{
+    unregister_device_op(op);
+    st().device_ops.push_back(State::DeviceOp{op, t, c, nullptr, nullptr});
+}
+inline const State::DeviceOp* find_device_op(MPI_Op op)
+{
+    for (const auto& e : st().device_ops)
+        if (e.op == op) return &e;
+    return nullptr;
+}
+
 /* is `op` one of the predefined operations with a device kernel? */
 inline int op_code(MPI_Op op)
 {
@@ -416,6 +470,22 @@ inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, M
 #if defined(COLLAGE_CUDA)
     if (device()) {
         State& s = st();
+        if (const State::DeviceOp* e = find_device_op(op)) {
+            /* user op with a device implementation; otherwise its host
+             * function (never on device pointers: --gpu-reduce mpi stages too) */
+            if (s.rmode == ReduceMode::Kernel) {
+                before_stream_op();
+                const bool done = e->fn ? e->fn(in, inout, count, dt, (void*)s.stream, e->ctx) == 0
+                                        : collage_gpu::device_reduce(e->type, e->code, in, inout, count, s.stream);
+                if (done) {
+                    queued();
+                    ++s.reductions_kernel;
+                    return;
+                }
+            }
+            reduce_staged(in, inout, count, dt, op);
+            return;
+        }
         const int oc = op_code(op);
         if (oc < 0 || s.rmode == ReduceMode::Host) {
             reduce_staged(in, inout, count, dt, op);  /* user op, or forced */

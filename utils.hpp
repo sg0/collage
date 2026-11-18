@@ -18,6 +18,7 @@
  */
 
 #include <mpi.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <climits>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "memory.hpp"
+#include "collage_op_plugin.h"
 #include <type_traits>
 
 #if defined(MPI_VERSION) && (MPI_VERSION >= 4) && !defined(COLLAGE_NO_LARGE_COUNT)
@@ -101,6 +103,29 @@ template <> inline MPI_Datatype TypeMap<int64_t>()  { return MPI_INT64_T; }
 template <> inline MPI_Datatype TypeMap<uint64_t>() { return MPI_UINT64_T; }
 template <> inline MPI_Datatype TypeMap<float>()    { return MPI_FLOAT; }
 template <> inline MPI_Datatype TypeMap<double>()   { return MPI_DOUBLE; }
+/* low-precision types (lowp.hpp) travel as a predefined integer of their size;
+ * their reductions use collage's own MPI ops (make_op) */
+template <> inline MPI_Datatype TypeMap<lowp::float16>()     { return MPI_UINT16_T; }
+template <> inline MPI_Datatype TypeMap<lowp::bfloat16>()    { return MPI_UINT16_T; }
+template <> inline MPI_Datatype TypeMap<lowp::float8_e4m3>() { return MPI_UINT8_T; }
+template <> inline MPI_Datatype TypeMap<lowp::float8_e5m2>() { return MPI_UINT8_T; }
+
+/* element type -> kernel table entry (gpu_ops.hpp) */
+template <typename T> constexpr collage_gpu::DType dtype_of();
+template <> constexpr collage_gpu::DType dtype_of<int8_t>() { return collage_gpu::DType::I8; }
+template <> constexpr collage_gpu::DType dtype_of<uint8_t>() { return collage_gpu::DType::U8; }
+template <> constexpr collage_gpu::DType dtype_of<int16_t>() { return collage_gpu::DType::I16; }
+template <> constexpr collage_gpu::DType dtype_of<uint16_t>() { return collage_gpu::DType::U16; }
+template <> constexpr collage_gpu::DType dtype_of<int32_t>() { return collage_gpu::DType::I32; }
+template <> constexpr collage_gpu::DType dtype_of<uint32_t>() { return collage_gpu::DType::U32; }
+template <> constexpr collage_gpu::DType dtype_of<int64_t>() { return collage_gpu::DType::I64; }
+template <> constexpr collage_gpu::DType dtype_of<uint64_t>() { return collage_gpu::DType::U64; }
+template <> constexpr collage_gpu::DType dtype_of<float>() { return collage_gpu::DType::F32; }
+template <> constexpr collage_gpu::DType dtype_of<double>() { return collage_gpu::DType::F64; }
+template <> constexpr collage_gpu::DType dtype_of<lowp::float16>() { return collage_gpu::DType::F16; }
+template <> constexpr collage_gpu::DType dtype_of<lowp::bfloat16>() { return collage_gpu::DType::BF16; }
+template <> constexpr collage_gpu::DType dtype_of<lowp::float8_e4m3>() { return collage_gpu::DType::F8E4M3; }
+template <> constexpr collage_gpu::DType dtype_of<lowp::float8_e5m2>() { return collage_gpu::DType::F8E5M2; }
 
 /* ------------------------------------------------------------------------- */
 /* reduction operations                                                      */
@@ -119,6 +144,38 @@ inline void user_sum_fn(void* in, void* inout, int* len, MPI_Datatype*)
     T* b = static_cast<T*>(inout);
     for (int i = 0; i < *len; ++i) b[i] = (T)(a[i] + b[i]);
 }
+/* a predefined operation on a low-precision type: same operator as the kernel */
+template <typename T, class Op>
+inline void lowp_fn(void* in, void* inout, int* len, MPI_Datatype*)
+{
+    const T* a = static_cast<const T*>(in);
+    T* b = static_cast<T*>(inout);
+    Op op;
+    for (int i = 0; i < *len; ++i) b[i] = op(a[i], b[i]);
+}
+/* -o plugin:PATH (collage_op_plugin.h): loaded once per path, never unloaded
+ * (MPI may hold its host function until MPI_Finalize) */
+inline const collage_op_plugin* load_plugin(const std::string& path)
+{
+    static std::vector<std::pair<std::string, const collage_op_plugin*>> loaded;
+    for (auto& l : loaded)
+        if (l.first == path) return l.second;
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) throw std::invalid_argument("plugin " + path + ": " + dlerror());
+    void* sym = dlsym(h, "collage_op_plugin_get");
+    if (!sym) throw std::invalid_argument("plugin " + path + ": no collage_op_plugin_get symbol");
+    const collage_op_plugin* p = ((collage_op_plugin_get_fn)sym)();
+    if (!p || p->abi != COLLAGE_OP_PLUGIN_ABI)
+        throw std::invalid_argument("plugin " + path + ": ABI " + std::to_string(p ? p->abi : -1) + ", collage expects " +
+                                    std::to_string(COLLAGE_OP_PLUGIN_ABI));
+    if (!p->host_fn) throw std::invalid_argument("plugin " + path + ": host_fn is required");
+    loaded.emplace_back(path, p);
+    return p;
+}
+inline int plugin_device_fn(const void* in, void* inout, size_t count, MPI_Datatype dt, void* stream, void* ctx)
+{
+    return static_cast<const collage_op_plugin*>(ctx)->device_fn(in, inout, count, dt, stream);
+}
 /* MPI: inout[i] = in[i] op inout[i]; "in" always comes from the lower ranks */
 inline void user_first_fn(void* in, void* inout, int* len, MPI_Datatype* dt)
 {
@@ -135,6 +192,9 @@ struct OpInfo {
     MPI_Op op = MPI_OP_NULL;
     OpKind kind = OpKind::Arithmetic;
     bool user = false;     /* created with MPI_Op_create -> must be freed */
+    bool emulated = false; /* a predefined op re-created for a low-precision type */
+    bool device = false;   /* user op registered with a device reduction (memory.hpp) */
+    std::string device_note; /* how it is reduced on GPU data (run header) */
     bool commute = true;
 };
 
@@ -146,7 +206,7 @@ inline std::vector<std::string> op_names()
 
 /* Create the MPI_Op for a given name and element type T. */
 template <typename T>
-inline OpInfo make_op(const std::string& name)
+inline OpInfo make_op(const std::string& name, const std::string& type_name = "")
 {
     OpInfo o;
     o.name = name;
@@ -163,15 +223,55 @@ inline OpInfo make_op(const std::string& name)
     else if (name == "user") {
         MPI_CHECK(MPI_Op_create(&detail::user_sum_fn<T>, 1, &o.op));
         o.kind = OpKind::User; o.user = true;
+        /* the same function as a device kernel: GPU reductions stay on the GPU */
+        mem::register_builtin_device_op(o.op, dtype_of<T>(), collage_gpu::OpCode::Sum);
+        o.device = true;
+        o.device_note = "built-in device kernel (sum)";
     } else if (name == "user_nc") {
         MPI_CHECK(MPI_Op_create(&detail::user_first_fn, 0, &o.op));
         o.kind = OpKind::User; o.user = true;
+        mem::register_builtin_device_op(o.op, dtype_of<T>(), collage_gpu::OpCode::First);
+        o.device = true;
+        o.device_note = "built-in device kernel (f(a,b) = a)";
+    } else if (name.rfind("plugin:", 0) == 0) {
+        const std::string path = name.substr(7);
+        const collage_op_plugin* p = detail::load_plugin(path);
+        if (p->init && p->init(type_name.c_str(), sizeof(T)) != 0)
+            throw std::invalid_argument("plugin " + path + " does not support type " + type_name);
+        MPI_CHECK(MPI_Op_create(p->host_fn, p->commute ? 1 : 0, &o.op));
+        o.kind = OpKind::User; o.user = true;
+        o.name = std::string("plugin:") + (p->name && *p->name ? p->name : path);
+        if (p->device_fn) {
+            mem::register_device_op(o.op, &detail::plugin_device_fn, const_cast<collage_op_plugin*>(p));
+            o.device = true;
+            o.device_note = "plugin device kernel";
+        }
     } else {
         throw std::invalid_argument("unknown reduction operation '" + name + "'");
     }
-    if (o.kind == OpKind::Bitwise && std::is_floating_point<T>::value)
+    if (o.kind == OpKind::Bitwise && lowp::is_float_like<T>::value)
         throw std::invalid_argument("bitwise operation '" + name +
                                     "' is not defined for floating point types");
+    if constexpr (lowp::is_lowp<T>::value) {
+        /* MPI has no such type: replace the predefined op with ours */
+        if (o.kind != OpKind::User) {
+            using namespace collage_gpu;
+            MPI_User_function* fn = nullptr;
+            OpCode c = OpCode::Unknown;
+            if (name == "sum") { fn = &detail::lowp_fn<T, OpSum<T>>; c = OpCode::Sum; }
+            else if (name == "prod") { fn = &detail::lowp_fn<T, OpProd<T>>; c = OpCode::Prod; }
+            else if (name == "max") { fn = &detail::lowp_fn<T, OpMax<T>>; c = OpCode::Max; }
+            else if (name == "min") { fn = &detail::lowp_fn<T, OpMin<T>>; c = OpCode::Min; }
+            else if (name == "land") { fn = &detail::lowp_fn<T, OpLAnd<T>>; c = OpCode::LAnd; }
+            else if (name == "lor") { fn = &detail::lowp_fn<T, OpLOr<T>>; c = OpCode::LOr; }
+            else if (name == "lxor") { fn = &detail::lowp_fn<T, OpLXor<T>>; c = OpCode::LXor; }
+            MPI_CHECK(MPI_Op_create(fn, 1, &o.op));
+            o.user = true;
+            o.emulated = true;
+            o.device = true;
+            mem::register_builtin_device_op(o.op, dtype_of<T>(), c);
+        }
+    }
     int c = 1;
     MPI_CHECK(MPI_Op_commutative(o.op, &c));
     o.commute = (c != 0);
@@ -180,6 +280,7 @@ inline OpInfo make_op(const std::string& name)
 
 inline void free_op(OpInfo& o)
 {
+    if (o.device) mem::unregister_device_op(o.op);
     if (o.user && o.op != MPI_OP_NULL) MPI_Op_free(&o.op);
     o.op = MPI_OP_NULL;
 }

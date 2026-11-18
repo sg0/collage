@@ -140,6 +140,20 @@ inline Fill fill_for(const OpInfo& o)
 template <typename T>
 inline T gen_value(Fill f, int r, size_t i)
 {
+    if constexpr (lowp::is_lowp<T>::value) {
+        /* Low precision: every partial result must stay exactly representable
+         * so that any reduction order gives the same bits. Sums: sparse +-1
+         * (about 2p/M nonzero terms per element; exact up to ~1400 ranks for
+         * 16-bit types, ~500 for float8_e4m3, ~500 for float8_e5m2). Products:
+         * +-1 with a rare 2. Other fills are exact by construction (copies,
+         * min/max, logical). */
+        if (f == Fill::Sum) {
+            const uint64_t M = sizeof(T) == 2 ? 11 : std::is_same<T, lowp::float8_e5m2>::value ? 131 : 67;
+            const uint64_t k = ((uint64_t)r * 7 + (uint64_t)i * 13) % M;
+            return T(k == 0 ? 1 : k == 1 ? -1 : 0);
+        }
+        if (f == Fill::Prod) return T(((r + i) % 61 == 0) ? 2 : (((r + 2 * i) % 3 == 0) ? -1 : 1));
+    }
     switch (f) {
         case Fill::Data:
         case Fill::First: return (T)((uint64_t)r * 1000003ull + (uint64_t)i * 7919ull + 1);
@@ -156,7 +170,10 @@ inline T gen_value(Fill f, int r, size_t i)
 template <typename T>
 inline bool values_equal(T a, T b)
 {
-    if constexpr (std::is_floating_point<T>::value) {
+    if constexpr (lowp::is_lowp<T>::value) {
+        const float x = (float)a, y = (float)b; /* exact: the inputs keep every result representable */
+        return (x != x && y != y) || x == y;
+    } else if constexpr (std::is_floating_point<T>::value) {
         if (std::isnan(a) && std::isnan(b)) return true;
         if (std::isinf(a) || std::isinf(b)) return a == b;
         const double tol = sizeof(T) == 4 ? 1e-5 : 1e-12;
@@ -1238,7 +1255,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
         throw std::invalid_argument("--root out of range (must be < " + std::to_string(gsize) +
                                     (o.split_mask > 0 ? ", the group size)" : ")"));
 
-    OpInfo op = make_op<T>(o.op);
+    OpInfo op = make_op<T>(o.op, type_name);
     int exit_code = 0;
     {
         /* the runner (and every algorithm object) lives on the group communicator */
@@ -1266,6 +1283,11 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             print_layout(o, size, groups, gsize, slots, node_of);
             std::printf("# size means   : %s\n", runner->size_semantics());
             std::printf("# datatype     : %s (%zu bytes)\n", type_name.c_str(), sizeof(T));
+            if constexpr (lowp::is_lowp<T>::value)
+                std::printf("#                carried as %s; reductions use collage-defined MPI ops (float\n"
+                            "#                arithmetic, round-to-nearest-even%s), also for the native baseline\n",
+                            sizeof(T) == 2 ? "MPI_UINT16_T" : "MPI_UINT8_T",
+                            sizeof(T) == 1 ? ", saturating" : "");
             if (o.gpu) {
                 for (auto& l : o.gpu_report) std::printf("%s\n", l.c_str());
                 if (runner->reduction())
@@ -1273,9 +1295,11 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                                 o.gpu_reduce == "kernel" ? " (CUDA kernels for predefined ops)"
                                 : o.gpu_reduce == "mpi" ? " (MPI_Reduce_local on device pointers)"
                                                         : " (staged through pinned host memory)");
-                if (runner->reduction() && op.user)
-                    std::printf("#                user-defined op '%s': reduced on the host (staged)\n",
-                                op.name.c_str());
+                if (runner->reduction() && op.kind == OpKind::User)
+                    std::printf("#                user-defined op '%s': %s\n", op.name.c_str(),
+                                op.device && o.gpu_reduce == "kernel"
+                                    ? op.device_note.c_str()
+                                    : "reduced on the host (staged; its MPI function is host code)");
             } else {
                 std::printf("# buffers      : host memory\n");
             }

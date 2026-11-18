@@ -1,6 +1,6 @@
-# collage — point-to-point collective algorithm benchmark
+# COLLAGE — COLLective AlGorithm bEnchmark
 
-`collage` benchmarks the collective algorithms from Open MPI's `coll/base`
+`COLLAGE` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
 is re-implemented with plain MPI point-to-point calls. You pick one collective,
 and `collage` times every algorithm for it (plus the MPI library's own
@@ -24,6 +24,8 @@ HPC ahead.
 | `onesided_transport.hpp`, `onesided_proto.hpp`, `onesided_device_ops.hpp`, `onesided_device.cu` | `--transport ucp` and `--transport shmem`: the device-initiated one-sided engine (host setup per back end: UCX or NVSHMEM), shared layouts, the GPU protocol (one copy, a few primitives per back end), and its kernels |
 | `memory.hpp` | memory layer: host/GPU space, `Buf<T>` temporaries with a caching device allocator, overlap-safe copies, reduction dispatch |
 | `gpu_ops.hpp`, `gpu_reduce.cu` | element-wise reduction operators and their CUDA kernels (built with `make CUDA=1`) |
+| `lowp.hpp` | float16, bfloat16, float8_e4m3, float8_e5m2: storage types and their conversions (host and device) |
+| `collage_op_plugin.h`, `examples/op_plugin_absmax.cu` | plugin ABI for custom reduction operators with a CUDA kernel (`-o plugin:PATH`), and a complete example |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
 | `bench.cpp` | command-line driver, runtime datatype dispatch |
 | `scripts/` | Slurm job scripts for parameter studies on NERSC Perlmutter (see [scripts/README.md](scripts/README.md)) |
@@ -85,8 +87,8 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 |---|---|---|
 | `-c NAME` | collective: `allgather allgatherv allreduce alltoall alltoallv barrier bcast gather reduce reduce_scatter reduce_scatter_block scatter` | – |
 | `-a LIST` | algorithms to run (`native` = the MPI library's collective) | all + native |
-| `-t TYPE` | `int8 uint8 int16 uint16 int32 uint32 int64 uint64 float double` | `double` |
-| `-o OP` | `sum prod max min land lor lxor band bor bxor user user_nc` | `sum` |
+| `-t TYPE` | `int8 uint8 int16 uint16 int32 uint32 int64 uint64 float double`, and the low-precision `float16` (`half`, `fp16`), `bfloat16` (`bf16`), `float8_e4m3` (`float8`, `fp8`), `float8_e5m2` (see [Low-precision types](#low-precision-types)) | `double` |
+| `-o OP` | `sum prod max min land lor lxor band bor bxor user user_nc`, or `plugin:PATH` (a custom operator with an optional CUDA kernel) | `sum` |
 | `-m / -M / -f` | min bytes / max bytes / geometric factor | `0 / 4M / 2` |
 | `--sizes LIST` | explicit sizes (overrides `-m/-M/-f`), e.g. `0,8,1K,4M` | – |
 | `-r R` | root of `bcast reduce gather scatter` | `0` |
@@ -116,9 +118,9 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
 
-### What "size" means
+### Message sizes
 
-| collective | message size is … |
+| collective | message size |
 |---|---|
 | bcast | bytes broadcast |
 | reduce, allreduce | bytes reduced on each rank |
@@ -517,6 +519,12 @@ operations are also available:
   exercises the order-preserving paths: in-order binary trees, the
   non-commutative branches of recursive doubling and butterfly, and the
   upstream fallbacks.
+* `plugin:PATH`: your own operator from a shared library, with an optional
+  CUDA kernel. See [Custom operators with a device kernel](#custom-operators-with-a-device-kernel).
+
+On GPU data, `user` and `user_nc` run as device kernels (sum and copy) with
+`--gpu-reduce kernel`. MPI itself only knows their host functions, so the
+native baseline and `--gpu-reduce mpi|host` stage them through the host.
 
 Algorithms that upstream documents or implements as commutative-only report
 `n/a` for non-commutative ops instead of returning wrong results. These are:
@@ -526,6 +534,94 @@ reduce `chain/pipeline/binary/binomial/knomial`, allreduce
 ops (e.g. `redscat_gather` → `linear`), the fallback is kept.
 
 Any `MPI_Op` can be passed to the headers directly.
+
+### Custom operators with a device kernel
+
+An `MPI_Op` made with `MPI_Op_create` is a host function: MPI cannot run it
+on device memory. collage keeps a registry that maps such an op to a device
+reduction, so the algorithms can run it on the GPU (`memory.hpp`):
+
+```cpp
+// inout = in (op) inout, queued on collage's stream; return 0, or nonzero to
+// fall back to the host function for this call
+int my_reduce(const void* in, void* inout, size_t count, MPI_Datatype dt,
+              void* stream /* cudaStream_t */, void* ctx);
+
+MPI_Op op;
+MPI_Op_create(&my_host_fn, /*commute=*/1, &op);   // MPI and host-side reductions
+mem::register_device_op(op, &my_reduce, ctx);     // GPU reductions in every algorithm
+Allreduce<float> ar(comm);  ar.ring(sbuf, rbuf, count, op);
+mem::unregister_device_op(op);
+```
+
+From the benchmark, `-o plugin:./libmyop.so` loads the same pair from a
+shared library that exports `collage_op_plugin_get()` (`collage_op_plugin.h`).
+It provides:
+
+* `name`, shown as `plugin:<name>` in the output and the CSV.
+* `commute`. With 0, the algorithms that need commutativity report `n/a`, as
+  for `user_nc`.
+* `host_fn`, the `MPI_User_function` (required).
+* `device_fn` (optional). It queues the kernel on collage's stream.
+* `init` (optional). It receives collage's type name, such as `"bfloat16"`,
+  so a plugin can tell the low-precision types apart, since they travel as
+  `MPI_UINT16_T`/`MPI_UINT8_T`. It can also reject a type.
+
+```bash
+nvcc -O3 -std=c++17 -arch=sm_80 -shared -Xcompiler -fPIC -I$MPI_HOME/include -I. \
+     -o libabsmax.so examples/op_plugin_absmax.cu
+srun ./collage -c allreduce -t bfloat16 -o plugin:./libabsmax.so --gpu --check
+```
+
+The device launcher must queue its work on the given stream and return. It
+must not synchronise or call MPI. With the stream-triggered and one-sided
+transports, the reduction is one step of a stream-ordered sequence that also
+holds the sends and receives. The run header says how the op is reduced, and
+the footer counts kernel, MPI and host-staged reductions. A launcher that
+returns nonzero, `--gpu-reduce mpi|host`, and the native baseline all use the
+host function.
+
+`--check` compares the algorithms against MPI's own collective with the same
+op, using the small-integer `sum` inputs. Your host and device functions must
+therefore agree, and the op must be associative. If it is not exact (for
+example, floating-point arithmetic other than min/max), the comparison is
+exact only when the order of the reduction does not change the result.
+
+### Low-precision types
+
+`-t float16`, `bfloat16`, `float8_e4m3` and `float8_e5m2` (OCP 8-bit formats;
+E4M3 is the "FN" variant with no infinity and a maximum of 448, E5M2 is
+IEEE-like with a maximum of 57344). MPI has no standard datatypes for them, so:
+
+* **Data movement.** The elements travel as a predefined integer of the same
+  size (`MPI_UINT16_T`, `MPI_UINT8_T`). That is byte-exact, works with every
+  transport, and keeps derived datatypes (Bruck's indexed types) predefined
+  underneath.
+* **Reductions.** collage re-creates `sum prod max min land lor lxor` for each
+  type with `MPI_Op_create`. Each step converts both operands to float,
+  applies the operator, and rounds back once (round-to-nearest-even). The
+  8-bit formats saturate to their largest finite value (like CUDA's
+  `__NV_SATFINITE`); float16 and bfloat16 overflow to infinity. Bitwise ops
+  are rejected, and `user`/`user_nc` work as for the other types. The native
+  baseline uses the same ops, so it runs MPI's algorithm with a user-defined
+  op. With `--gpu` that relies on the MPI library handling user ops on device
+  buffers (MPICH-based libraries stage them through the host).
+* **GPU reductions.** The same operators have CUDA kernels: `--gpu-reduce
+  kernel` (the default) runs them on the device. `mpi` and `host` stage
+  through the host, since the MPI op is a host function. Device code converts
+  with CUDA's intrinsics (`cuda_fp16.h`, `cuda_fp8.h`, so CUDA ≥ 11.8;
+  hardware conversion on sm_89+). These round like the host code.
+  `-DCOLLAGE_LOWP_SOFT` keeps the portable conversion on the device too.
+  Accumulation is per step: a reduction over p ranks rounds p − 1 times,
+  which is what a collective in these formats does. Accuracy therefore
+  depends on the algorithm's reduction order, which is part of what you can
+  measure here.
+* **Verification.** `--check` compares bit for bit. To make every reduction
+  order give the same bits, the inputs are chosen so that all partial results
+  stay exactly representable. Sums use sparse ±1 terms; this stays exact up to
+  about 1,400 ranks for the 16-bit types and about 500 for the 8-bit ones.
+  Products use ±1 with a rare 2. min/max, logical ops and copies are exact by
+  construction.
 
 ## Algorithms
 
@@ -564,6 +660,49 @@ sub-algorithms, so nothing reaches the MPI library's collectives:
 
 To use different sub-steps, change the corresponding line in the header.
 
+## Changes relative to the draft and to upstream
+
+The draft headers were partly copied Open MPI source (`MCA_PML_CALL`,
+`ompi_datatype_*`, `goto err_hndl`) and partly unfinished ports. `utils.hpp`
+was only present as a vim swap file. Everything was rewritten against the
+upstream sources at the commit above, keeping control flow and message
+schedules identical. These are the changes:
+
+* **Buffers are typed, counts are elements.** Every algorithm takes `T*`
+  buffers and `size_t` counts/displacements. The draft computed offsets as
+  `(T*)buf + i * count * sizeof(T)`, which scales by `sizeof(T)` twice. It also
+  had separate send/recv types `U`/`T`; one element type is used now.
+* **Packing and datatype copies became `memcpy`.** `opal_convertor_pack` (the
+  in-place alltoall(v)), `ompi_datatype_sndrcv` and
+  `ompi_datatype_copy_content_same_ddt` are equivalent to `memcpy` for
+  contiguous predefined types. Indexed datatypes are still built with
+  `MPI_Type_indexed(_c)` where upstream uses them (alltoall bruck, allgatherv
+  bruck / neighborexchange / basic_default, reduce_scatter_block
+  recursivedoubling).
+* **Persistent requests are freed.** Linear alltoall(v) now calls
+  `MPI_Request_free` on its persistent requests after `MPI_Waitall`. The draft
+  leaked them.
+* **Sparbit tags are non-negative.** Sparbit uses `TAG_BASE + block` instead of
+  upstream's negative internal tag space. At very large scale,
+  `1000 + size` must not exceed `MPI_TAG_UB`. MPI guarantees at least 32767,
+  and real implementations allow far more.
+* **Signed arithmetic in bcast scatter_allgather(_ring).** At this commit,
+  upstream uses `size_t` for `recv_count`/`send_count` and then tests
+  `<= 0` / `< 0`. That can underflow when blocks run past the end of the
+  buffer. The port uses signed 64-bit counts, which is what the code intends.
+* **Zero-size messages run the algorithm.** MPI libraries return early for
+  most collectives at count 0. Here, the 0-byte row runs each algorithm with
+  empty messages, which measures its latency term. Segmented algorithms use one
+  empty segment, and leaf processes in segmented reduce always send at least
+  one message, so the tree never deadlocks. The exceptions are algorithms
+  where upstream itself returns early for zero counts (`reduce_scatter_block`
+  and reduce_scatter `recursivehalving`).
+* **`TypeMap<long>` fixed.** The draft mapped `long` to `MPI_LONG_INT`, which
+  is a pair type. The type map now uses fixed-width `MPI_INT*_T`/`MPI_UINT*_T`.
+* **Errors abort, unsupported cases throw.** Errors go through `MPI_CHECK`,
+  which reports file and line and aborts. Algorithms that can't run in a given
+  configuration throw `NotApplicable`, and the harness reports `n/a`.
+
 ## Verification
 
 `--check` runs the native MPI collective once per size to build the
@@ -578,7 +717,7 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Job scripts
+## Job scripts for evaluations
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and

@@ -81,9 +81,13 @@ void usage()
         "      --list             list collectives and their algorithms, then exit\n"
         "  -t, --type TYPE        int8 uint8 int16 uint16 int32 uint32 int64 uint64\n"
         "                         float double (default double)\n"
+        "                         float16 bfloat16 float8_e4m3 (alias float8) float8_e5m2:\n"
+        "                         carried as uint16/uint8, reduced in float with one\n"
+        "                         rounding per step (8-bit formats saturate)\n"
         "  -o, --op OP            reduction: sum prod max min land lor lxor band bor bxor\n"
         "                         user (user-defined sum) user_nc (non-commutative)\n"
-        "                         (default sum)\n"
+        "                         plugin:PATH (shared library, collage_op_plugin.h: a host\n"
+        "                         MPI function + optional CUDA launcher) (default sum)\n"
         "\n"
         "message sizes (bytes; K/M/G suffixes accepted)\n"
         "  -m, --min BYTES        smallest size (default 0)\n"
@@ -324,6 +328,11 @@ int run_typed(const Options& o)
     if (t == "uint64") return dispatch_run<uint64_t>(o, "uint64");
     if (t == "float") return dispatch_run<float>(o, "float");
     if (t == "double") return dispatch_run<double>(o, "double");
+    if (t == "float16" || t == "half" || t == "fp16") return dispatch_run<lowp::float16>(o, "float16");
+    if (t == "bfloat16" || t == "bf16") return dispatch_run<lowp::bfloat16>(o, "bfloat16");
+    if (t == "float8_e4m3" || t == "float8" || t == "fp8" || t == "e4m3")
+        return dispatch_run<lowp::float8_e4m3>(o, "float8_e4m3");
+    if (t == "float8_e5m2" || t == "e5m2") return dispatch_run<lowp::float8_e5m2>(o, "float8_e5m2");
     throw std::invalid_argument("unknown type '" + t + "'");
 }
 

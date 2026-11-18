@@ -25,6 +25,7 @@ CXXFLAGS  ?= -O3 -std=c++17 -Wall -Wextra
 all: collage
 LDFLAGS   ?=
 LIBS      ?=
+LIBS      += -ldl
 
 ifeq ($(NO_LARGE_COUNT),1)
 CXXFLAGS += -DCOLLAGE_NO_LARGE_COUNT
