@@ -25,6 +25,8 @@ Figure kinds (--kind, comma separated, default all):
             (+ tunables_best.csv, the table view)
   ppn       latency vs processes per node at a few sizes (CPU studies)
   buffers   host-memory / GPU-memory latency ratio vs size (GPU studies)
+  transport CUDA-aware MPI / stream-triggered latency ratio vs size, per
+            transport (GPU runs with --transport cray|mpich|acx, TRANSPORTS=...)
 
 Each figure is written for every combination of the "configuration" columns
 present in the data (study, buffers, ppn, layout, type, op, ...); narrow it
@@ -74,8 +76,9 @@ ALGOS = {
     "scatter": "binomial linear linear_nb",
 }
 ALGOS = {k: v.split() for k, v in ALGOS.items()}
-BUF_COLS = ["study", "ranks_per_node", "layoutname", "type", "op", "gpu_reduce"]
-CONFIG_COLS = ["study", "buffers", "gpu_reduce", "ranks_per_node", "layoutname", "type", "op", "root"]
+BUF_COLS = ["study", "transport", "ranks_per_node", "layoutname", "type", "op", "gpu_reduce"]
+XPORT_COLS = ["study", "ranks_per_node", "layoutname", "type", "op", "gpu_reduce"]
+CONFIG_COLS = ["study", "buffers", "gpu_reduce", "transport", "ranks_per_node", "layoutname", "type", "op", "root"]
 
 
 def theme():
@@ -177,7 +180,7 @@ def load(paths):
     df = pd.concat(frames, ignore_index=True)
 
     # older CSVs (before nodes/ppn/buffers columns) still load
-    for col, default in (("nodes", 1), ("ranks_per_node", 0), ("buffers", "host"), ("gpu_reduce", "-"),
+    for col, default in (("nodes", 1), ("ranks_per_node", 0), ("buffers", "host"), ("gpu_reduce", "-"), ("transport", "mpi"),
                          ("layout", "-"), ("tag", ""), ("groups", 1), ("aggbw_MBps", np.nan),
                          ("group_ranks", 0)):
         if col not in df.columns:
@@ -218,7 +221,7 @@ def apply_filters(df, a):
     def lst(s, conv=str):
         return [conv(x) for x in s.split(",")] if s else None
     for col, val, conv in (("study", a.study, str), ("collective", a.coll, str), ("nodes", a.nodes, int), ("ranks_per_node", a.ppn, int),
-                           ("layoutname", a.layout, str), ("buffers", a.buffers, str), ("op", a.op, str),
+                           ("layoutname", a.layout, str), ("buffers", a.buffers, str), ("transport", a.transport, str), ("op", a.op, str),
                            ("type", a.type, str)):
         v = lst(val, conv)
         if v is not None:
@@ -301,6 +304,8 @@ def config_label(cols, key):
         if c == "root" and int(v) == 0:
             continue
         if c == "study" and v == "-":
+            continue
+        if c == "transport" and v == "mpi":
             continue
         name = {"ranks_per_node": "ppn", "layoutname": "layout", "gpu_reduce": "reduce"}.get(c, c)
         parts.append(f"{name}={v}")
@@ -543,23 +548,11 @@ def fig_layout(df, a):
     return made
 
 
-def fig_buffers(df, a):
-    """latency(host buffers) / latency(GPU buffers) per algorithm"""
+def ratio_figures(m, a, group_cols, ylabel, title, subdir):
+    """line plots of m["ratio"] vs size, one panel per node count, one line per algorithm"""
     made = []
-    if set(df["buffers"]) < {"host", "gpu"}:
-        return made
-    keys = ["study", "collective", "variant", "algorithm", "nodes", "bytes", "ranks_per_node", "layoutname", "type",
-            "op", "root"]
-    g = df[df["buffers"] == "gpu"]
-    if a.gpu_reduce:
-        g = g[g["gpu_reduce"].isin(a.gpu_reduce.split(",") + ["-"])]
-    h = df[df["buffers"] == "host"][keys + ["avg_us"]].rename(columns={"avg_us": "host_us"})
-    m = g.merge(h, on=keys, how="inner")
-    if m.empty:
-        return made
-    m["ratio"] = m["host_us"] / m["avg_us"]
     for coll, dc in m[m["collective"] != "barrier"].groupby("collective"):
-        for key, d in dc.groupby(BUF_COLS, dropna=False):
+        for key, d in dc.groupby(group_cols, dropna=False):
             nodes = sorted(d["nodes"].unique())
             sizes = sorted(d["bytes"].unique())
             if len(sizes) < 2:
@@ -593,15 +586,53 @@ def fig_buffers(df, a):
             for ax in axes.flat[len(nodes):]:
                 ax.set_visible(False)
             for ax in axes[:, 0]:
-                ax.set_ylabel("host latency / GPU latency")
+                ax.set_ylabel(ylabel)
             fig.legend(handles=legend_handles(styles, order), loc="center left", bbox_to_anchor=(1.0, 0.5),
                        title="algorithm")
-            label = config_label(BUF_COLS, key)
-            fig.suptitle(f"{coll}: GPU buffers vs host buffers (>1: GPU buffers faster)  ·  {label}", x=0.02,
-                         ha="left", fontsize=11)
+            label = config_label(group_cols, key)
+            fig.suptitle(f"{coll}: {title}  ·  {label}", x=0.02, ha="left", fontsize=11)
             fig.tight_layout()
-            slug = config_slug(BUF_COLS, key)
-            made.append(save(fig, os.path.join(a.out, "buffers"), f"{coll}__{slug}", a.formats))
+            slug = config_slug(group_cols, key)
+            made.append(save(fig, os.path.join(a.out, subdir), f"{coll}__{slug}", a.formats))
+    return made
+
+
+def fig_buffers(df, a):
+    """latency(host buffers) / latency(GPU buffers) per algorithm"""
+    if set(df["buffers"]) < {"host", "gpu"}:
+        return []
+    keys = ["study", "collective", "variant", "algorithm", "nodes", "bytes", "ranks_per_node", "layoutname", "type",
+            "op", "root"]
+    g = df[df["buffers"] == "gpu"]
+    if a.gpu_reduce:
+        g = g[g["gpu_reduce"].isin(a.gpu_reduce.split(",") + ["-"])]
+    h = df[(df["buffers"] == "host")][keys + ["avg_us"]].rename(columns={"avg_us": "host_us"})
+    m = g.merge(h, on=keys, how="inner")
+    if m.empty:
+        return []
+    m["ratio"] = m["host_us"] / m["avg_us"]
+    return ratio_figures(m, a, BUF_COLS, "host latency / GPU latency",
+                         "GPU buffers vs host buffers (>1: GPU buffers faster)", "buffers")
+
+
+def fig_transport(df, a):
+    """latency(plain CUDA-aware MPI) / latency(stream-triggered transport), GPU buffers"""
+    # native calls the library's collective whatever the transport: left out
+    g = df[(df["buffers"] == "gpu") & (df["algorithm"] != "native")]
+    if g["transport"].nunique() < 2 or "mpi" not in set(g["transport"]):
+        return []
+    keys = ["study", "collective", "variant", "algorithm", "nodes", "bytes", "ranks_per_node", "layoutname", "type",
+            "op", "root", "gpu_reduce"]
+    base = g[g["transport"] == "mpi"][keys + ["avg_us"]].rename(columns={"avg_us": "mpi_us"})
+    made = []
+    for t in sorted(set(g["transport"]) - {"mpi"}):
+        m = g[g["transport"] == t].merge(base, on=keys, how="inner")
+        if m.empty:
+            continue
+        m["ratio"] = m["mpi_us"] / m["avg_us"]
+        made += ratio_figures(m, a, XPORT_COLS, f"latency mpi / latency {t}",
+                              f"stream-triggered transport {t} vs CUDA-aware MPI (>1: {t} faster)",
+                              os.path.join("transport", t.replace(":", "-")))
     return made
 
 
@@ -737,7 +768,7 @@ def main():
     ap.add_argument("inputs", nargs="+", help="directories (searched recursively) or CSV files")
     ap.add_argument("-o", "--out", default="figs", help="output directory (default figs)")
     ap.add_argument("--kind", default="all",
-                    help="latency,best,scaling,layout,random,tunables,ppn,buffers or all")
+                    help="latency,best,scaling,layout,random,tunables,ppn,buffers,transport or all")
     ap.add_argument("--study", help="only these studies (algos,split,tunables; from the job tag)")
     ap.add_argument("--formats", default="png,pdf", help="image formats (default png,pdf)")
     ap.add_argument("--coll", help="only these collectives (comma list)")
@@ -746,6 +777,7 @@ def main():
     ap.add_argument("--ppn", help="only these ranks-per-node values")
     ap.add_argument("--layout", help="only these layouts (world,node,cross,stride:2,random:0.5,group:512,...)")
     ap.add_argument("--buffers", help="host and/or gpu")
+    ap.add_argument("--transport", help="only these transports (mpi,cray,mpich,acx,ucp; ':all' or ':inter' suffix for a non-default --st-peers)")
     ap.add_argument("--gpu-reduce", dest="gpu_reduce", help="for --kind buffers: kernel,mpi,host")
     ap.add_argument("--op", help="only these reduction ops")
     ap.add_argument("--type", help="only these datatypes")
@@ -754,7 +786,7 @@ def main():
     ap.add_argument("--max-panels", type=int, default=12, help="algorithm panels in layout/tunables figures")
     a = ap.parse_args()
     a.formats = a.formats.split(",")
-    kinds = (["latency", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers"]
+    kinds = (["latency", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers", "transport"]
              if a.kind == "all" else a.kind.split(","))
 
     theme()
@@ -779,6 +811,8 @@ def main():
             made = fig_layout(df, a)
         elif k == "buffers":
             made = fig_buffers(df, a)
+        elif k == "transport":
+            made = fig_transport(df, a)
         elif k == "random":
             made = fig_random(df, a)
         elif k == "tunables":

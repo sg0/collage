@@ -27,6 +27,14 @@ cd $HOME/proj/collage          # or set COLLAGE_HOME to wherever the sources are
 scripts/build_perlmutter.sh # both binaries; or: cpu | gpu
 ```
 
+To also compile in Cray MPICH's stream-triggered transport (`--transport
+cray`, see the main README), build the GPU binary with
+`ST=cray scripts/build_perlmutter.sh gpu`. The plain transport stays
+available in that binary, so `TRANSPORTS="mpi cray"` compares both in one job.
+Whether the installed Cray MPICH supports these queues with CUDA streams is
+not confirmed: HPE documents them with HIP streams. Run a short `--check` job
+first.
+
 The CPU binary is built with `module load cpu` and `CC -march=znver3`. The GPU
 binary is built with `module load gpu cudatoolkit craype-accel-nvidia80` and
 `CRAY_ACCEL_TARGET=nvidia80`, which links Cray MPICH's GPU transport layer. The
@@ -38,7 +46,7 @@ reduction kernels are built for `sm_80`.
 scripts/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
 scripts/submit_study.sh split gpu
 scripts/submit_study.sh all both        # every study on both node types: 24 jobs
-NODE_COUNTS="16 128" TIME=08:00:00 scripts/submit_study.sh tunables cpu
+NODE_COUNTS="16 128" TIME=08:00:00 perlmutter/submit_study.sh tunables cpu
 sbatch -N 64 scripts/collage_split_cpu.sbatch   # a single job
 ```
 
@@ -87,6 +95,8 @@ Each study script only sets defaults.
 | `BUFFERS` | GPU scripts: `gpu`, `host` or `"gpu host"` (`algos` default: both) |
 | `GPU_REDUCE` | local reductions on GPU data: `kernel` `mpi` `host` (`kernel`) |
 | `GPU_MAP` | device of local rank i (`3,2,1,0`) |
+| `TRANSPORTS` | GPU scripts: transports of the algorithms' messages, e.g. `"mpi cray"` (`mpi`; `cray` needs `ST=cray
+scripts/build_perlmutter.sh gpu`; `ucp` is for InfiniBand/RoCE clusters, since UCX has no device lanes on Slingshot) |
 | `MAX_MEM` | per-rank buffer cap (CPU: half the node's memory / PPN; GPU: 16G) |
 | `STEP_MIN`, `SAFETY_MIN` | step time limit and margin, in minutes (20 or 30, and 2) |
 | `STUDY`, `OUTDIR` | output location (`$SCRATCH/collage_study/<study>/<cpu\|gpu>_<N>N`) |
@@ -129,7 +139,7 @@ can confirm the mapping. For the 80 GB A100 nodes, use `-C "gpu&hbm80g"`
 
 ```
 $SCRATCH/collage_study/<study>/<cpu|gpu>_<N>N/
-    raw/<coll>__<buffers>__ppn<P>__<layout>__<type>__<op>[__<reduce>].csv
+    raw/<coll>__<buffers>__ppn<P>__<layout>__<type>__<op>[__<reduce>][__st-<transport>].csv
     logs/<same name>.log          collage's stdout/stderr (layout report, table)
     manifest.tsv                  every step: job, status, rc, seconds, csv, command
     job_<id>.info                 nodes, modules, environment
@@ -158,11 +168,12 @@ python3 plots/plot_collage.py $SCRATCH/collage_study --study algos --kind buffer
 | `scaling` | latency vs node count at a few sizes (`--sizes 1K,64K,4M`) |
 | `ppn` | latency vs processes per node, per node count (CPU) |
 | `buffers` | host-buffer latency / GPU-buffer latency vs size (GPU `algos` study) |
+| `transport` | CUDA-aware MPI latency / stream-triggered latency vs size, one figure set per transport (GPU runs with `TRANSPORTS="mpi cray"`) |
 | `layout` | aggregate bandwidth vs size, one panel per algorithm, one line per layout (`split`) |
 | `random` | aggregate bandwidth vs p of `PPN:p`, with p = 0 for the `node` layout, one line per algorithm (`split`) |
 | `tunables` | per algorithm: rows of tunable settings × sizes, latency relative to the fastest row (native included), ● marks the fastest (+ `tunables_best.csv`) |
 
-Filters: `--study --coll --algos --nodes --ppn --layout --buffers --gpu-reduce
+Filters: `--study --coll --algos --nodes --ppn --layout --buffers --transport --gpu-reduce
 --op --type`. One figure is written for each combination of the configuration
 columns that remain (study, buffers, reduce mode, PPN, layout, type, op, root).
 Output formats are set with `--formats` (default `png,pdf`).

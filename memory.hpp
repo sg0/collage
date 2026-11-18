@@ -90,6 +90,9 @@ struct State {
     bool pending = false;              /* work queued since the last sync() */
     void (*before_stream_op)() = nullptr; /* transport hook, run before queueing work */
     void (*before_sync)() = nullptr;      /* transport hook, run before waiting */
+    /* transport hooks for device memory (--transport ucp: a registered arena) */
+    void* (*raw_alloc)(size_t) = nullptr;
+    void (*raw_free)(void*) = nullptr;
     /* statistics, for the run header / debugging */
     size_t reductions_kernel = 0, reductions_mpi = 0, reductions_staged = 0;
 };
@@ -178,7 +181,8 @@ inline void* device_alloc(size_t bytes)
         p = fl.back();
         fl.pop_back();
     } else {
-        CUDA_CHECK(cudaMalloc(&p, cap));
+        if (s.raw_alloc) p = s.raw_alloc(cap);
+        else CUDA_CHECK(cudaMalloc(&p, cap));
     }
     s.live[p] = cap;
     return p;
@@ -198,12 +202,29 @@ inline void device_free(void* p)
 #endif
 
 /* release cached device memory and the stream (call before MPI_Finalize) */
+/* release every cached device block (through the transport hook, if any) */
+inline void drop_pool()
+{
+#if defined(COLLAGE_CUDA)
+    State& s = st();
+    for (auto& kv : s.pool)
+        for (void* p : kv.second) {
+            if (s.raw_free) s.raw_free(p);
+            else cudaFree(p);
+        }
+    s.pool.clear();
+#endif
+}
+
 inline void shutdown()
 {
 #if defined(COLLAGE_CUDA)
     State& s = st();
     for (auto& kv : s.pool)
-        for (void* p : kv.second) cudaFree(p);
+        for (void* p : kv.second) {
+            if (s.raw_free) s.raw_free(p);
+            else cudaFree(p);
+        }
     s.pool.clear();
     for (int i = 0; i < 2; ++i)
         if (s.stage[i]) cudaFreeHost(s.stage[i]);

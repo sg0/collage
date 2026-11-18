@@ -18,6 +18,11 @@
  *   cray   HPE Cray MPICH stream-triggered (ST) operations on Slingshot:
  *          MPIX_Queue bound to our CUDA stream, MPIX_Enqueue_{send,recv},
  *          MPIX_Enqueue_start (trigger), MPIX_Enqueue_wait.
+ *   ucp    UCX GPU device API (UCX >= 1.20, ucp_transport.hpp): no MPI after
+ *          bootstrap; GPU kernels issue one-sided puts and remote counter
+ *          increments themselves (GDA on ConnectX InfiniBand/RoCE, CUDA IPC
+ *          on a node). Every send/recv is a rendezvous of device-initiated
+ *          puts (see ucp_proto.hpp).
  *
  * With a stream-triggered transport an algorithm runs *in stream order*: its
  * sends, receives and waits are queued on the CUDA stream together with the
@@ -78,10 +83,11 @@
 
 #include "memory.hpp"
 
-#if (defined(COLLAGE_ST_MPICH) + defined(COLLAGE_ST_ACX) + defined(COLLAGE_ST_CRAY)) > 1
-#error "build with at most one stream-triggered transport (ST=mpich, ST=acx or ST=cray)"
+#if (defined(COLLAGE_ST_MPICH) + defined(COLLAGE_ST_ACX) + defined(COLLAGE_ST_CRAY) + defined(COLLAGE_ST_UCP)) > 1
+#error "build with at most one stream-triggered transport (ST=mpich, ST=acx, ST=cray or ST=ucp)"
 #endif
-#if (defined(COLLAGE_ST_MPICH) || defined(COLLAGE_ST_ACX) || defined(COLLAGE_ST_CRAY)) && !defined(COLLAGE_CUDA)
+#if (defined(COLLAGE_ST_MPICH) || defined(COLLAGE_ST_ACX) || defined(COLLAGE_ST_CRAY) || defined(COLLAGE_ST_UCP)) && \
+    !defined(COLLAGE_CUDA)
 #error "stream-triggered transports need GPU support (make CUDA=1 ST=...)"
 #endif
 #if defined(COLLAGE_ST_MPICH) && (!defined(MPICH_NUMVERSION) || MPICH_NUMVERSION < 40100000)
@@ -89,6 +95,9 @@
 #endif
 #if defined(COLLAGE_ST_ACX)
 #include <mpi-acx.h>
+#endif
+#if defined(COLLAGE_ST_UCP)
+#include "ucp_transport.hpp"
 #endif
 
 /* Cray MPICH: the documented synopsis is MPIX_Create_queue(stream, &queue);
@@ -105,7 +114,7 @@
 
 namespace xport {
 
-enum class Kind { Mpi, Mpich, Acx, Cray };
+enum class Kind { Mpi, Mpich, Acx, Cray, Ucp };
 
 inline const char* kind_name(Kind k)
 {
@@ -114,6 +123,7 @@ inline const char* kind_name(Kind k)
         case Kind::Mpich: return "mpich";
         case Kind::Acx: return "acx";
         case Kind::Cray: return "cray";
+        case Kind::Ucp: return "ucp";
     }
     return "?";
 }
@@ -124,6 +134,7 @@ inline bool parse_kind(const std::string& s, Kind& k)
     else if (s == "mpich") k = Kind::Mpich;
     else if (s == "acx") k = Kind::Acx;
     else if (s == "cray") k = Kind::Cray;
+    else if (s == "ucp") k = Kind::Ucp;
     else return false;
     return true;
 }
@@ -142,6 +153,9 @@ inline bool kind_built(Kind k)
 #if defined(COLLAGE_ST_CRAY)
         case Kind::Cray: return true;
 #endif
+#if defined(COLLAGE_ST_UCP)
+        case Kind::Ucp: return true;
+#endif
         default: return false;
     }
 }
@@ -149,7 +163,7 @@ inline bool kind_built(Kind k)
 inline std::string built_list()
 {
     std::string s = "mpi";
-    for (Kind k : {Kind::Mpich, Kind::Acx, Kind::Cray})
+    for (Kind k : {Kind::Mpich, Kind::Acx, Kind::Cray, Kind::Ucp})
         if (kind_built(k)) s += std::string(", ") + kind_name(k);
     return s;
 }
@@ -167,11 +181,12 @@ struct Request {
     void* x = nullptr;                /* Enq for acx (MPIX_Request) */
     Persist* p = nullptr;             /* Pers: emulated persistent request */
     int q = -1;                       /* Enq for cray: index of its queue */
+    int u = -1;                       /* Enq for ucp: index of its operation */
 };
 
 inline bool operator==(const Request& a, const Request& b)
 {
-    return a.k == b.k && a.h == b.h && a.x == b.x && a.p == b.p && a.q == b.q;
+    return a.k == b.k && a.h == b.h && a.x == b.x && a.p == b.p && a.q == b.q && a.u == b.u;
 }
 inline bool operator!=(const Request& a, const Request& b) { return !(a == b); }
 
@@ -211,6 +226,12 @@ struct State {
     /* receive statuses filled by the stream: user status -> our storage */
     std::deque<MPI_Status> slots;
     std::unordered_map<const MPI_Status*, MPI_Status*> slot_of;
+#if defined(COLLAGE_ST_UCP)
+    std::unordered_map<const MPI_Status*, int> ucp_status_of; /* receive status -> operation */
+    size_t ucp_heap = (size_t)4 << 30;
+    uint32_t ucp_slots = 16;
+    double ucp_timeout = 60.0;
+#endif
     /* statistics */
     unsigned long long enqueued = 0, plain = 0, host_waits = 0, drains = 0;
 };
@@ -233,7 +254,11 @@ inline bool large_count()
 /* thread level MPI_Init_thread must provide: the stream-triggered libraries
  * call MPI from their own threads (MPI-ACX proxy, MPICH GPU host functions or
  * progress thread) while the main thread keeps issuing MPI calls */
-inline int required_thread_level(Kind k) { return k == Kind::Mpi ? MPI_THREAD_SINGLE : MPI_THREAD_MULTIPLE; }
+inline int required_thread_level(Kind k)
+{
+    /* ucp: MPI is only the bootstrap, called from the main thread */
+    return (k == Kind::Mpi || k == Kind::Ucp) ? MPI_THREAD_SINGLE : MPI_THREAD_MULTIPLE;
+}
 
 inline int icount(size_t c)
 {
@@ -286,7 +311,7 @@ inline void configure(Kind k, bool all_peers, bool progress_thread)
     if (!mem::device()) throw std::invalid_argument("stream-triggered transports need --gpu");
     int provided = MPI_THREAD_SINGLE;
     MPI_Query_thread(&provided);
-    if (provided < MPI_THREAD_MULTIPLE)
+    if (provided < required_thread_level(k))
         throw std::runtime_error(std::string("--transport ") + kind_name(k) +
                                  " needs MPI_THREAD_MULTIPLE, the MPI library provides only level " +
                                  std::to_string(provided));
@@ -318,6 +343,9 @@ inline void configure(Kind k, bool all_peers, bool progress_thread)
 #if defined(COLLAGE_ST_CRAY)
     /* cray: queues are created on demand (cray_queue()) */
 #endif
+#if defined(COLLAGE_ST_UCP)
+    if (k == Kind::Ucp) ucpx::init(s.ucp_heap, s.ucp_slots, s.ucp_timeout, s.stream);
+#endif
     mem::st().async = true;
     mem::st().before_stream_op = &flush_hook;
     mem::st().before_sync = &flush_hook;
@@ -347,6 +375,9 @@ inline void shutdown()
         s.queues_used = 0;
     }
 #endif
+#if defined(COLLAGE_ST_UCP)
+    if (s.kind == Kind::Ucp) ucpx::finalize();
+#endif
     mem::st().async = false;
     mem::st().before_stream_op = nullptr;
     mem::st().before_sync = nullptr;
@@ -371,6 +402,10 @@ inline void drain()
     s.held_types.clear();
     s.slots.clear();
     s.slot_of.clear();
+#if defined(COLLAGE_ST_UCP)
+    s.ucp_status_of.clear();
+    if (s.kind == Kind::Ucp) ucpx::after_drain(); /* raises errors the GPU reported */
+#endif
     ++s.drains;
 }
 
@@ -444,9 +479,18 @@ public:
             own_ = true;
         }
 #endif
+#if defined(COLLAGE_ST_UCP)
+        if (st().kind == Kind::Ucp) uc_ = ucpx::comm_open(comm); /* control area */
+#endif
     }
     void close()
     {
+#if defined(COLLAGE_ST_UCP)
+        if (uc_) {
+            ucpx::comm_close(uc_);
+            uc_ = nullptr;
+        }
+#endif
         if (own_) {
             int fin = 0;
             MPI_Finalized(&fin);
@@ -465,12 +509,18 @@ public:
     MPI_Comm comm() const { return comm_; }   /* plain path */
     MPI_Comm scomm() const { return scomm_; } /* stream path */
     int remote_peers() const { return nremote_; }
+#if defined(COLLAGE_ST_UCP)
+    ucpx::Comm* ucomm() const { return uc_; }
+#endif
 
 private:
     MPI_Comm comm_ = MPI_COMM_NULL, scomm_ = MPI_COMM_NULL;
     std::vector<char> remote_;
     int nremote_ = 0;
     bool own_ = false;
+#if defined(COLLAGE_ST_UCP)
+    ucpx::Comm* uc_ = nullptr;
+#endif
 };
 
 /* ------------------------------------------------------------------------- */
@@ -526,11 +576,15 @@ inline void enq_isend(const Channel& ch, const void* buf, size_t count, MPI_Data
                       Request* r)
 {
     State& s = st();
-    dt = hold_type(dt);
+#if !defined(COLLAGE_ST_UCP)
+    dt = hold_type(dt); /* (ucp flattens the type at once) */
+#endif
     *r = Request{};
     r->k = Request::Enq;
     (void)ch; (void)buf; (void)count; (void)dt; (void)dest; (void)tag; (void)s;
-#if defined(COLLAGE_ST_MPICH)
+#if defined(COLLAGE_ST_UCP)
+    r->u = ucpx::isend(ch.ucomm(), buf, count, dt, dest, tag);
+#elif defined(COLLAGE_ST_MPICH)
 #if defined(MPI_VERSION) && MPI_VERSION >= 4 && !defined(COLLAGE_NO_LARGE_COUNT)
     MPI_CHECK(MPIX_Isend_enqueue_c(buf, (MPI_Count)count, dt, dest, tag, ch.scomm(), &r->h));
 #else
@@ -552,11 +606,15 @@ inline void enq_isend(const Channel& ch, const void* buf, size_t count, MPI_Data
 inline void enq_irecv(const Channel& ch, void* buf, size_t count, MPI_Datatype dt, int src, int tag, Request* r)
 {
     State& s = st();
+#if !defined(COLLAGE_ST_UCP)
     dt = hold_type(dt);
+#endif
     *r = Request{};
     r->k = Request::Enq;
     (void)ch; (void)buf; (void)count; (void)dt; (void)src; (void)tag; (void)s;
-#if defined(COLLAGE_ST_MPICH)
+#if defined(COLLAGE_ST_UCP)
+    r->u = ucpx::irecv(ch.ucomm(), buf, count, dt, src, tag);
+#elif defined(COLLAGE_ST_MPICH)
 #if defined(MPI_VERSION) && MPI_VERSION >= 4 && !defined(COLLAGE_NO_LARGE_COUNT)
     MPI_CHECK(MPIX_Irecv_enqueue_c(buf, (MPI_Count)count, dt, src, tag, ch.scomm(), &r->h));
 #else
@@ -580,7 +638,10 @@ inline void enq_wait(Request* r, MPI_Status* user_status)
 {
     State& s = st();
     (void)s;
-#if defined(COLLAGE_ST_MPICH)
+#if defined(COLLAGE_ST_UCP)
+    ucpx::wait(&r->u, 1);
+    if (user_status != MPI_STATUS_IGNORE) s.ucp_status_of[user_status] = r->u;
+#elif defined(COLLAGE_ST_MPICH)
     MPI_CHECK(MPIX_Wait_enqueue(&r->h, status_slot(user_status)));
 #elif defined(COLLAGE_ST_ACX)
     XPORT_CHECK(MPIX_Wait_enqueue((MPIX_Request*)&r->x, status_slot(user_status), MPIX_QUEUE_CUDA_STREAM,
@@ -604,7 +665,11 @@ inline void enq_waitall(int n, Request** reqs)
     if (n <= 0) return;
     State& s = st();
     (void)s;
-#if defined(COLLAGE_ST_MPICH)
+#if defined(COLLAGE_ST_UCP)
+    std::vector<int> u((size_t)n);
+    for (int i = 0; i < n; ++i) u[(size_t)i] = reqs[i]->u;
+    ucpx::wait(u.data(), n);
+#elif defined(COLLAGE_ST_MPICH)
     std::vector<MPI_Request> h((size_t)n);
     for (int i = 0; i < n; ++i) h[(size_t)i] = reqs[i]->h;
     MPI_CHECK(MPIX_Waitall_enqueue(n, h.data(), MPI_STATUSES_IGNORE));
@@ -629,7 +694,12 @@ inline void enq_waitall(int n, Request** reqs)
  * earlier queued receive that used the same status object */
 inline void forget_status(MPI_Status* user)
 {
-    if (user != MPI_STATUS_IGNORE && st().kind != Kind::Mpi) st().slot_of.erase(user);
+    if (user != MPI_STATUS_IGNORE && st().kind != Kind::Mpi) {
+        st().slot_of.erase(user);
+#if defined(COLLAGE_ST_UCP)
+        st().ucp_status_of.erase(user);
+#endif
+    }
 }
 
 /* status of a receive completed on the stream: wait for the stream, copy it
@@ -639,6 +709,16 @@ inline bool fetch_status(MPI_Status* user)
 {
     State& s = st();
     if (s.kind == Kind::Mpi) return false;
+#if defined(COLLAGE_ST_UCP)
+    if (s.kind == Kind::Ucp) {
+        auto u = s.ucp_status_of.find(user);
+        if (u == s.ucp_status_of.end()) return false;
+        mem::sync();
+        ucpx::status(u->second, user);
+        s.ucp_status_of.erase(u);
+        return true;
+    }
+#endif
     auto it = s.slot_of.find(user);
     if (it == s.slot_of.end()) return false;
     if (!it->second)

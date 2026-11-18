@@ -10,6 +10,10 @@
 #                              + NVIDIA MPI-ACX (--transport acx), on any MPI with
 #                              MPI_THREAD_MULTIPLE and MPI-4 partitioned calls
 #   make CUDA=1 ST=cray        + Cray MPICH stream-triggered ops (--transport cray)
+#   make CUDA=1 ST=ucp UCX_HOME=/opt/ucx CUDA_ARCH=-arch=sm_90
+#                              + UCX GPU device API (--transport ucp): device-initiated
+#                              one-sided puts; UCX >= 1.20 built --with-cuda (and
+#                              with GDA for ConnectX InfiniBand/RoCE)
 MPICXX    ?= mpicxx
 CXXFLAGS  ?= -O3 -std=c++17 -Wall -Wextra
 
@@ -60,8 +64,19 @@ acx_dlink.o: .build-config
 	$(NVCC) $(ACX_ARCH) -dlink -o $@ -L$(ACX_HOME) -lmpi-acx
 else ifeq ($(ST),cray)
 CXXFLAGS += -DCOLLAGE_ST_CRAY
+else ifeq ($(ST),ucp)
+UCX_HOME  ?= /usr
+UCX_LIB   ?= $(UCX_HOME)/lib
+CXXFLAGS  += -DCOLLAGE_ST_UCP -I$(UCX_HOME)/include
+LDFLAGS   += -L$(UCX_LIB) -Wl,-rpath,$(UCX_LIB)
+LIBS      += -lucp -luct -lucs
+OBJS      += ucp_device.o
+
+# the UCX device API is header-only CUDA code (GDA and CUDA-IPC lanes)
+ucp_device.o: ucp_device.cu ucp_device_ops.hpp ucp_proto.hpp .build-config
+	$(NVCC) $(NVCCFLAGS) -I$(UCX_HOME)/include -I. -c -o $@ ucp_device.cu
 else
-$(error ST must be mpich, acx or cray)
+$(error ST must be mpich, acx, cray or ucp)
 endif
 endif
 
@@ -75,7 +90,7 @@ collage: bench.cpp $(HEADERS) $(OBJS) .build-config
 	$(MPICXX) $(CXXFLAGS) -o $@ bench.cpp $(OBJS) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f collage gpu_reduce.o acx_dlink.o .build-config
+	rm -f collage gpu_reduce.o acx_dlink.o ucp_device.o .build-config
 
 FORCE:
 .PHONY: all clean FORCE
