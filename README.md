@@ -634,7 +634,7 @@ itself.
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and
 algorithm tunables (`tunables`). `plots/plot_collage.py` turns their CSV
 output into figures. Build, submission and plotting are described in
-[scripts/README.md](perlmutter/README.md).
+[scripts/README.md](scripts/README.md).
 
 ## License
 
