@@ -611,14 +611,7 @@ schedules identical. These are the changes:
 
 `--check` runs the native MPI collective once per size to build the
 reference. It then re-initialises the inputs, runs each algorithm once on
-poisoned output buffers, and compares the result element by element. The
-comparison covers the root for rooted collectives and every rank otherwise.
-Inputs are small integers chosen per operation, so floating-point sums and
-products are exact whatever the reduction order.
-
-The full matrix was run with MPICH 4.2.3 and passed. It covered 1–8 ranks, all
-collectives and algorithms, all operations, several types, roots, segment
-sizes, radices, request limits and count distributions.
+poisoned output buffers, and compares the result element by element. 
 
 ## Cost model
 
