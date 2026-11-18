@@ -1277,7 +1277,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             MPI_Get_library_version(ver, &vlen);
             std::string v(ver, vlen);
             v = v.substr(0, v.find('\n'));
-            std::printf("# collage: point-to-point collective algorithm benchmark\n");
+            std::printf("# COLLAGE: COLLective AlGorithm bEnchmark\n");
             std::printf("# MPI library  : %s\n", v.c_str());
             std::printf("# collective   : %s (%d ranks)\n", o.coll.c_str(), size);
             print_layout(o, size, groups, gsize, slots, node_of);

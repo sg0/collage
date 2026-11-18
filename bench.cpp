@@ -70,8 +70,7 @@ void usage()
     std::printf(
         "usage: collage -c COLLECTIVE [options]\n"
         "\n"
-        "Benchmarks the Open MPI coll/base algorithms of one collective, implemented\n"
-        "with MPI point-to-point, over a range of message sizes.\n"
+        "Benchmarks collective algorithms per pattern, implemented over a range of message sizes.\n"
         "\n"
         "selection\n"
         "  -c, --coll NAME        allgather allgatherv allreduce alltoall alltoallv barrier\n"
