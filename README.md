@@ -564,49 +564,6 @@ sub-algorithms, so nothing reaches the MPI library's collectives:
 
 To use different sub-steps, change the corresponding line in the header.
 
-## Changes relative to the draft and to upstream
-
-The draft headers were partly copied Open MPI source (`MCA_PML_CALL`,
-`ompi_datatype_*`, `goto err_hndl`) and partly unfinished ports. `utils.hpp`
-was only present as a vim swap file. Everything was rewritten against the
-upstream sources at the commit above, keeping control flow and message
-schedules identical. These are the changes:
-
-* **Buffers are typed, counts are elements.** Every algorithm takes `T*`
-  buffers and `size_t` counts/displacements. The draft computed offsets as
-  `(T*)buf + i * count * sizeof(T)`, which scales by `sizeof(T)` twice. It also
-  had separate send/recv types `U`/`T`; one element type is used now.
-* **Packing and datatype copies became `memcpy`.** `opal_convertor_pack` (the
-  in-place alltoall(v)), `ompi_datatype_sndrcv` and
-  `ompi_datatype_copy_content_same_ddt` are equivalent to `memcpy` for
-  contiguous predefined types. Indexed datatypes are still built with
-  `MPI_Type_indexed(_c)` where upstream uses them (alltoall bruck, allgatherv
-  bruck / neighborexchange / basic_default, reduce_scatter_block
-  recursivedoubling).
-* **Persistent requests are freed.** Linear alltoall(v) now calls
-  `MPI_Request_free` on its persistent requests after `MPI_Waitall`. The draft
-  leaked them.
-* **Sparbit tags are non-negative.** Sparbit uses `TAG_BASE + block` instead of
-  upstream's negative internal tag space. At very large scale,
-  `1000 + size` must not exceed `MPI_TAG_UB`. MPI guarantees at least 32767,
-  and real implementations allow far more.
-* **Signed arithmetic in bcast scatter_allgather(_ring).** At this commit,
-  upstream uses `size_t` for `recv_count`/`send_count` and then tests
-  `<= 0` / `< 0`. That can underflow when blocks run past the end of the
-  buffer. The port uses signed 64-bit counts, which is what the code intends.
-* **Zero-size messages run the algorithm.** MPI libraries return early for
-  most collectives at count 0. Here, the 0-byte row runs each algorithm with
-  empty messages, which measures its latency term. Segmented algorithms use one
-  empty segment, and leaf processes in segmented reduce always send at least
-  one message, so the tree never deadlocks. The exceptions are algorithms
-  where upstream itself returns early for zero counts (`reduce_scatter_block`
-  and reduce_scatter `recursivehalving`).
-* **`TypeMap<long>` fixed.** The draft mapped `long` to `MPI_LONG_INT`, which
-  is a pair type. The type map now uses fixed-width `MPI_INT*_T`/`MPI_UINT*_T`.
-* **Errors abort, unsupported cases throw.** Errors go through `MPI_CHECK`,
-  which reports file and line and aborts. Algorithms that can't run in a given
-  configuration throw `NotApplicable`, and the harness reports `n/a`.
-
 ## Verification
 
 `--check` runs the native MPI collective once per size to build the
