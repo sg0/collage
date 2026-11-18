@@ -38,8 +38,12 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"            # passed to collage verbatim (e.g. "-s 0
 DRYRUN="${DRYRUN:-0}"
 FORCE="${FORCE:-0}"
 STUDY="${STUDY:-algos}"
-TRANSPORTS="${TRANSPORTS:-mpi}"         # GPU buffers: mpi | cray | mpich | acx (stream-triggered ones
-                                        # need a binary built with ST=..., see build_perlmutter.sh)
+TRANSPORTS="${TRANSPORTS:-mpi}"         # GPU buffers: mpi | cray | mpich | acx | shmem (all but mpi
+                                        # need a binary built with ST=..., see build_perlmutter.sh;
+                                        # shmem: ST=nvshmem)
+# NERSC's nvshmem module bootstraps with PMIx by default; collage hands NVSHMEM
+# an MPI communicator, so use NVSHMEM's MPI bootstrap
+case " $TRANSPORTS " in *" shmem "*) export NVSHMEM_BOOTSTRAP="${NVSHMEM_BOOTSTRAP:-MPI}" ;; esac
 OUTDIR="${OUTDIR:-${SCRATCH:-$PWD}/collage_study/${STUDY}/${NODE_TYPE}_${NODES}N}"
 NODE_MEM_GB="${NODE_MEM_GB:?set NODE_MEM_GB (host memory per node)}"
 MEM_FRACTION_PCT="${MEM_FRACTION_PCT:-50}"   # share of node memory for benchmark buffers

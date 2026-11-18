@@ -90,7 +90,7 @@ struct State {
     bool pending = false;              /* work queued since the last sync() */
     void (*before_stream_op)() = nullptr; /* transport hook, run before queueing work */
     void (*before_sync)() = nullptr;      /* transport hook, run before waiting */
-    /* transport hooks for device memory (--transport ucp: a registered arena) */
+    /* transport hooks for device memory (--transport ucp/shmem: the one-sided arena) */
     void* (*raw_alloc)(size_t) = nullptr;
     void (*raw_free)(void*) = nullptr;
     /* statistics, for the run header / debugging */

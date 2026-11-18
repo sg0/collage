@@ -4,6 +4,14 @@
 #   bin/collage-gpu : GPU nodes   (module load gpu: cudatoolkit + craype-accel-nvidia80,
 #                                  CUDA-aware Cray MPICH via the GTL library)
 # Usage:  perlmutter/build_perlmutter.sh [cpu|gpu|both]   (default both)
+#         ST=cray perlmutter/build_perlmutter.sh gpu
+#             also compiles in the Cray MPICH stream-triggered transport
+#             (--transport cray); the plain one stays available.
+#         ST=nvshmem perlmutter/build_perlmutter.sh gpu
+#             NVSHMEM device API instead (--transport shmem), with NERSC's
+#             standalone nvshmem module (libfabric on Slingshot: a host proxy
+#             posts the GPU's operations, so a device-API comparison point
+#             next to cray, not IBGDA). Set NVSHMEM_HOME to use another build.
 #
 # Cray wrappers: CC is used instead of mpicxx. CRAY_ACCEL_TARGET=nvidia80 links
 # the GPU Transport Layer (without it, MPICH_GPU_SUPPORT_ENABLED=1 aborts with
@@ -33,11 +41,18 @@ build_gpu() (
     module load cudatoolkit craype-accel-nvidia80
     export CRAY_ACCEL_TARGET=nvidia80
     : "${CUDA_HOME:?cudatoolkit did not set CUDA_HOME}"
+    local extra=()
+    if [ "${ST:-}" = nvshmem ]; then
+        [ -n "${NVSHMEM_HOME:-}" ] || module load nvshmem
+        NVSHMEM_HOME="${NVSHMEM_HOME:-${NVSHMEM_DIR:-${NVSHMEM_ROOT:-}}}"
+        : "${NVSHMEM_HOME:?the nvshmem module did not set NVSHMEM_HOME (set it by hand)}"
+        extra+=(NVSHMEM_HOME="$NVSHMEM_HOME")
+    fi
     make clean >/dev/null
-    make CUDA=1 MPICXX=CC NVCC="$(command -v nvcc)" CUDA_HOME="$CUDA_HOME" \
+    make CUDA=1 ${ST:+ST=$ST} "${extra[@]}" MPICXX=CC NVCC="$(command -v nvcc)" CUDA_HOME="$CUDA_HOME" \
          CUDA_ARCH="-arch=sm_80" NVCCFLAGS="-O3 -std=c++17 -arch=sm_80"
     cp collage bin/collage-gpu
-    echo "built bin/collage-gpu"
+    echo "built bin/collage-gpu${ST:+ (with --transport $ST)}"
 )
 
 case "$which" in

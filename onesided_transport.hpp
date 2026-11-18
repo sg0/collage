@@ -1,22 +1,29 @@
 #pragma once
-#ifndef COLLAGE_UCP_TRANSPORT_HPP
-#define COLLAGE_UCP_TRANSPORT_HPP
+#ifndef COLLAGE_ONESIDED_TRANSPORT_HPP
+#define COLLAGE_ONESIDED_TRANSPORT_HPP
 
 /*
- * Host side of the UCP device transport (--transport ucp, build ST=ucp):
- * device-initiated one-sided communication with the UCX GPU device API
- * (UCX >= 1.20; GDA lanes = rc_gda on ConnectX InfiniBand/RoCE, CUDA-IPC lanes
- * on a node). See ucp_proto.hpp for the protocol.
+ * Host side of the device-initiated one-sided transports (see
+ * onesided_proto.hpp for the protocol):
  *
- * MPI is used only to bootstrap: exchange worker addresses, rkeys, arena and
- * control-area addresses. At run time the host only enqueues kernels; the
- * GPU triggers every transfer and signal itself.
+ *   --transport ucp    (build ST=ucp)      UCX GPU device API, UCX >= 1.20:
+ *                      GDA lanes (rc_gda on ConnectX InfiniBand/RoCE) and
+ *                      CUDA-IPC lanes on a node
+ *   --transport shmem  (build ST=nvshmem)  NVSHMEM device API: IBGDA on
+ *                      ConnectX, NVLink/P2P on a node, or a proxy transport
+ *                      (e.g. libfabric on Slingshot)
  *
- *  - One registered device arena per process (--ucp-heap); the device memory
- *    pool of memory.hpp draws from it, so every buffer an algorithm uses is
- *    reachable by peers as (peer arena base + offset).
+ * MPI is used only to bootstrap (ucp: worker addresses and rkeys; both: arena
+ * and control-area offsets; shmem: NVSHMEM's own bootstrap over
+ * MPI_COMM_WORLD). At run time the host only enqueues kernels; the GPU
+ * triggers every transfer and signal itself.
+ *
+ *  - One device arena per process (--ucp-heap / --shmem-heap): registered with
+ *    UCX, or one object on the NVSHMEM symmetric heap. The device memory pool
+ *    of memory.hpp draws from it, so every buffer an algorithm uses is
+ *    reachable by peers as (peer arena + offset).
  *  - One control area per communicator (CollBase): rts/data counters and
- *    descriptor rings (--ucp-slots receives in flight per peer).
+ *    descriptor rings (--ucp-slots / --shmem-slots receives in flight per peer).
  *  - Each operation gets one device copy for the whole call (kernels keep
  *    its state there). isend records the operation (and packs a derived
  *    datatype); irecv launches the receiver-ready kernel at once; wait/waitall
@@ -28,12 +35,13 @@
  *    GPU to mapped host memory and raised at the end of the call.
  */
 
-#if defined(COLLAGE_ST_UCP)
+#if defined(COLLAGE_ST_UCP) || defined(COLLAGE_ST_NVSHMEM)
 
 #include <cuda_runtime.h>
 #include <mpi.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <map>
@@ -42,23 +50,35 @@
 #include <vector>
 
 #include "memory.hpp"
-#include "ucp_proto.hpp"
+#include "onesided_proto.hpp"
 
-#if defined(COLLAGE_UCP_ARENA_HOOK)
+#if defined(COLLAGE_OS_ARENA_HOOK) && defined(COLLAGE_OS_UCX)
 /* test seam: the emulation provides process-shared arena memory */
-void* collage_ucp_arena_alloc(size_t bytes);
-void collage_ucp_arena_free(void* p, size_t bytes);
+void* collage_os_arena_alloc(size_t bytes);
+void collage_os_arena_free(void* p, size_t bytes);
 #endif
 
-namespace ucpx {
+namespace osx {
 
-using ucpp::Op;
+using osp::Op;
 
+/* how the user selected and tunes this transport (for messages) */
+#if defined(COLLAGE_OS_UCX)
+inline const char* opt_name() { return "--transport ucp"; }
+inline const char* opt_prefix() { return "--ucp-"; }
+#else
+inline const char* opt_name() { return "--transport shmem"; }
+inline const char* opt_prefix() { return "--shmem-"; }
+#endif
+inline std::string opt(const char* what) { return std::string(opt_prefix()) + what; }
+
+#if defined(COLLAGE_OS_UCX)
 inline void ucheck(ucs_status_t st, const char* what)
 {
     if (st != UCS_OK)
         throw std::runtime_error(std::string("UCX: ") + what + ": " + ucs_status_string(st));
 }
+#endif
 inline void ccheck(cudaError_t e, const char* what)
 {
     if (e != cudaSuccess) throw std::runtime_error(std::string("CUDA: ") + what + ": " + cudaGetErrorString(e));
@@ -69,7 +89,7 @@ inline void agree(const std::string& err, MPI_Comm comm = MPI_COMM_WORLD)
 {
     int bad = err.empty() ? 0 : 1;
     MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, comm);
-    if (bad) throw std::runtime_error(err.empty() ? std::string("--transport ucp: setup failed on another rank") : err);
+    if (bad) throw std::runtime_error(err.empty() ? std::string(opt_name()) + ": setup failed on another rank" : err);
 }
 
 /* first-fit allocator over the registered arena */
@@ -97,14 +117,15 @@ public:
             if (in_use_ > peak_) peak_ = in_use_;
             return base_ + off;
         }
-        throw std::runtime_error("--transport ucp: device arena exhausted (" + std::to_string(bytes_ >> 20) +
-                                 " MiB in use); raise --ucp-heap or lower --max-mem");
+        throw std::runtime_error(std::string(opt_name()) + ": device arena exhausted (" +
+                                 std::to_string(bytes_ >> 20) + " MiB in use); raise " + opt("heap") +
+                                 " or lower --max-mem");
     }
     void free(void* p)
     {
         size_t off = (size_t)((char*)p - base_);
         auto u = used_.find(off);
-        if (u == used_.end()) throw std::logic_error("ucp arena: free of an unknown block");
+        if (u == used_.end()) throw std::logic_error("one-sided arena: free of an unknown block");
         size_t len = u->second;
         used_.erase(u);
         in_use_ -= len;
@@ -181,7 +202,7 @@ struct Comm {
     int p = 0, me = 0;
     std::vector<uint64_t> sseq, rseq; /* messages sent to / receives posted from each peer */
     void* ctl = nullptr;
-    ucpp::DevComm* d = nullptr;
+    osp::DevComm* d = nullptr;
     uint64_t* d_peer_ctl = nullptr;
     uint32_t* d_world = nullptr;
 };
@@ -198,14 +219,15 @@ struct HostOp {
 struct Engine {
     bool up = false;
     int wrank = 0, wsize = 1;
+    char* arena = nullptr;
+    size_t arena_bytes = 0;
+    Arena alloc;
+#if defined(COLLAGE_OS_UCX)
     ucp_context_h ctx = nullptr;
     ucp_worker_h worker = nullptr;
     std::vector<ucp_ep_h> eps;
     std::vector<ucp_rkey_h> rkeys;
     ucp_mem_h memh = nullptr;
-    char* arena = nullptr;
-    size_t arena_bytes = 0;
-    Arena alloc;
 #if COLLAGE_UCP_API == 2
     ucp_device_local_mem_list_h lh = nullptr;
     ucp_device_remote_mem_list_h rh = nullptr;
@@ -213,7 +235,11 @@ struct Engine {
     std::vector<ucp_device_mem_list_handle_h> handles;
     ucp_device_mem_list_handle_h* d_handles = nullptr;
 #endif
-    ucpp::Global g{};
+#else
+    MPI_Comm boot = MPI_COMM_NULL; /* NVSHMEM's bootstrap communicator */
+    std::string lib;               /* library name and version */
+#endif
+    osp::Global g{};
     uint64_t* err_host = nullptr;
     uint32_t R = 16;
     cudaStream_t stream = nullptr;
@@ -239,12 +265,16 @@ inline Engine& eng()
 inline void* arena_alloc(size_t bytes) { return eng().alloc.alloc(bytes); }
 inline void arena_free(void* p) { eng().alloc.free(p); }
 
-inline const char* api_name()
+inline std::string api_name()
 {
+#if defined(COLLAGE_OS_UCX)
 #if COLLAGE_UCP_API == 2
     return "UCX GPU device API (local/remote mem lists, UCX >= 1.21)";
 #else
     return "UCX GPU device API (per-endpoint mem lists, UCX 1.20)";
+#endif
+#else
+    return (eng().lib.empty() ? std::string("NVSHMEM") : eng().lib) + " device API (put-with-signal)";
 #endif
 }
 
@@ -273,10 +303,11 @@ inline void init(size_t heap_bytes, uint32_t slots, double timeout_s, cudaStream
     Engine& e = eng();
     MPI_Comm_rank(MPI_COMM_WORLD, &e.wrank);
     MPI_Comm_size(MPI_COMM_WORLD, &e.wsize);
-    e.R = slots < 1 ? 1 : (slots > ucpp::MAX_SLOTS ? ucpp::MAX_SLOTS : slots);
+    e.R = slots < 1 ? 1 : (slots > osp::MAX_SLOTS ? osp::MAX_SLOTS : slots);
     e.stream = stream;
     std::string err;
 
+#if defined(COLLAGE_OS_UCX)
     /* context and worker */
     try {
         ucp_config_t* cfg = nullptr;
@@ -326,8 +357,8 @@ inline void init(size_t heap_bytes, uint32_t slots, double timeout_s, cudaStream
     /* the registered arena */
     e.arena_bytes = heap_bytes;
     try {
-#if defined(COLLAGE_UCP_ARENA_HOOK)
-        e.arena = (char*)collage_ucp_arena_alloc(heap_bytes);
+#if defined(COLLAGE_OS_ARENA_HOOK)
+        e.arena = (char*)collage_os_arena_alloc(heap_bytes);
 #else
         ccheck(cudaMalloc((void**)&e.arena, heap_bytes), "arena (cudaMalloc of --ucp-heap)");
 #endif
@@ -344,7 +375,6 @@ inline void init(size_t heap_bytes, uint32_t slots, double timeout_s, cudaStream
         err = x.what();
     }
     agree(err);
-    e.alloc.reset(e.arena, heap_bytes);
 
     /* rkeys and arena bases of every rank */
     std::vector<uint64_t> base((size_t)e.wsize);
@@ -455,6 +485,39 @@ inline void init(size_t heap_bytes, uint32_t slots, double timeout_s, cudaStream
         ccheck(cudaMemcpy(e.d_handles, e.handles.data(), sizeof(void*) * (size_t)e.wsize, cudaMemcpyHostToDevice),
                "handle array copy");
 #endif
+    } catch (const std::exception& x) {
+        err = x.what();
+    }
+    agree(err);
+#else
+    /* NVSHMEM: bootstrap over (a duplicate of) MPI_COMM_WORLD, so PE = world
+     * rank; the symmetric heap must hold the arena */
+    e.arena_bytes = heap_bytes;
+    if (!std::getenv("NVSHMEM_SYMMETRIC_SIZE")) {
+        const std::string sz = std::to_string(heap_bytes + ((size_t)256 << 20)); /* + NVSHMEM's own needs */
+        setenv("NVSHMEM_SYMMETRIC_SIZE", sz.c_str(), 0);
+    }
+    MPI_Comm_dup(MPI_COMM_WORLD, &e.boot);
+    if (osk::shmem_init_mpi(&e.boot) != 0) err = "NVSHMEM: nvshmemx_init_attr (MPI bootstrap) failed";
+    else if (osk::shmem_n_pes() != e.wsize || osk::shmem_my_pe() != e.wrank)
+        err = "NVSHMEM: PEs do not match MPI_COMM_WORLD ranks";
+    agree(err);
+    {
+        char name[256] = {0};
+        osk::shmem_info(name, sizeof name);
+        e.lib = name;
+    }
+    e.arena = (char*)osk::shmem_malloc(heap_bytes); /* collective */
+    if (!e.arena)
+        err = "NVSHMEM: nvshmem_malloc of " + std::to_string(heap_bytes >> 20) + " MiB failed (lower " + opt("heap") +
+              " or raise NVSHMEM_SYMMETRIC_SIZE)";
+    else
+        try { ccheck(cudaMemset(e.arena, 0, heap_bytes), "arena memset"); ccheck(cudaDeviceSynchronize(), "arena memset"); } catch (const std::exception& x) { err = x.what(); }
+    agree(err);
+#endif
+    e.alloc.reset(e.arena, heap_bytes);
+
+    try {
         /* error word in mapped host memory: the GPU writes, the host reads for free */
         ccheck(cudaHostAlloc((void**)&e.err_host, 2 * sizeof(uint64_t), cudaHostAllocMapped), "error word");
         e.err_host[0] = e.err_host[1] = 0;
@@ -471,12 +534,14 @@ inline void init(size_t heap_bytes, uint32_t slots, double timeout_s, cudaStream
     e.g.arena = e.arena;
     e.g.timeout_ns = (uint64_t)(timeout_s * 1e9);
     e.g.me_world = (uint32_t)e.wrank;
+#if defined(COLLAGE_OS_UCX)
     e.g.channel = 0;
 #if COLLAGE_UCP_API == 2
     e.g.lh = e.lh;
     e.g.rh = e.rh;
 #else
     e.g.handles = e.d_handles;
+#endif
 #endif
     mem::st().raw_alloc = &arena_alloc;
     mem::st().raw_free = &arena_free;
@@ -497,6 +562,9 @@ inline void finalize()
     e.d_recvs = nullptr;
     e.d_cursor = nullptr;
     e.recv_cap = e.nrecv = 0;
+    if (e.err_host) cudaFreeHost(e.err_host);
+    e.err_host = nullptr;
+#if defined(COLLAGE_OS_UCX)
 #if COLLAGE_UCP_API == 2
     if (e.rh) ucp_device_mem_list_release(e.rh);
     if (e.lh) ucp_device_mem_list_release(e.lh);
@@ -529,18 +597,23 @@ inline void finalize()
     }
     e.eps.clear();
     MPI_Barrier(MPI_COMM_WORLD);
-#if defined(COLLAGE_UCP_ARENA_HOOK)
-    collage_ucp_arena_free(e.arena, e.arena_bytes);
+#if defined(COLLAGE_OS_ARENA_HOOK)
+    collage_os_arena_free(e.arena, e.arena_bytes);
 #else
     cudaFree(e.arena);
 #endif
     e.arena = nullptr;
-    if (e.err_host) cudaFreeHost(e.err_host);
-    e.err_host = nullptr;
     if (e.worker) ucp_worker_destroy(e.worker);
     if (e.ctx) ucp_cleanup(e.ctx);
     e.worker = nullptr;
     e.ctx = nullptr;
+#else
+    cudaDeviceSynchronize();
+    osk::shmem_free(e.arena); /* collective */
+    e.arena = nullptr;
+    osk::shmem_finalize();
+    if (e.boot != MPI_COMM_NULL) MPI_Comm_free(&e.boot);
+#endif
     e.up = false;
 }
 
@@ -555,7 +628,7 @@ inline Comm* comm_open(MPI_Comm comm)
     MPI_Comm_rank(comm, &c->me);
     c->sseq.assign((size_t)c->p, 0);
     c->rseq.assign((size_t)c->p, 0);
-    ucpp::CtlLayout L{e.R};
+    osp::CtlLayout L{e.R};
     const size_t bytes = (size_t)c->p * L.entry();
     std::string err;
     std::vector<uint64_t> offs((size_t)c->p);
@@ -565,6 +638,7 @@ inline Comm* comm_open(MPI_Comm comm)
         mine = (uint64_t)((char*)c->ctl - e.arena);
         ccheck(cudaMemset(c->ctl, 0, bytes), "control area");
         ccheck(cudaDeviceSynchronize(), "control area");
+#if defined(COLLAGE_OS_UCX)
         ucp_device_counter_params_t cp;
         std::memset(&cp, 0, sizeof cp);
         cp.field_mask = UCP_DEVICE_COUNTER_PARAMS_FIELD_MEMH;
@@ -574,6 +648,7 @@ inline Comm* comm_open(MPI_Comm comm)
             ucheck(ucp_device_counter_init(e.worker, &cp, en + L.rts_cnt()), "ucp_device_counter_init");
             ucheck(ucp_device_counter_init(e.worker, &cp, en + L.data_cnt()), "ucp_device_counter_init");
         }
+#endif /* shmem: signals are plain zeroed uint64 in symmetric memory */
     } catch (const std::exception& x) {
         err = x.what();
     }
@@ -590,7 +665,7 @@ inline Comm* comm_open(MPI_Comm comm)
     MPI_Group_free(&gc);
     std::vector<uint32_t> w32(wr.begin(), wr.end());
 
-    ucpp::DevComm h{};
+    osp::DevComm h{};
     h.p = (uint32_t)c->p;
     h.me = (uint32_t)c->me;
     h.me_world = (uint32_t)e.wrank;
@@ -598,7 +673,7 @@ inline Comm* comm_open(MPI_Comm comm)
     h.ctl_off = mine;
     ccheck(cudaMalloc((void**)&c->d_peer_ctl, sizeof(uint64_t) * offs.size()), "communicator");
     ccheck(cudaMalloc((void**)&c->d_world, sizeof(uint32_t) * w32.size()), "communicator");
-    ccheck(cudaMalloc((void**)&c->d, sizeof(ucpp::DevComm)), "communicator");
+    ccheck(cudaMalloc((void**)&c->d, sizeof(osp::DevComm)), "communicator");
     ccheck(cudaMemcpy(c->d_peer_ctl, offs.data(), sizeof(uint64_t) * offs.size(), cudaMemcpyHostToDevice), "communicator");
     ccheck(cudaMemcpy(c->d_world, w32.data(), sizeof(uint32_t) * w32.size(), cudaMemcpyHostToDevice), "communicator");
     h.peer_ctl_off = c->d_peer_ctl;
@@ -639,7 +714,7 @@ inline bool flatten(MPI_Datatype dt, size_t count, uint64_t& bytes, std::vector<
         return false;
     }
     if (comb != MPI_COMBINER_INDEXED)
-        throw std::runtime_error("--transport ucp: only predefined and indexed datatypes are supported");
+        throw std::runtime_error(std::string(opt_name()) + ": only predefined and indexed datatypes are supported");
     std::vector<int> ints((size_t)ni);
     std::vector<MPI_Aint> aints((size_t)na);
     std::vector<MPI_Datatype> types((size_t)nd);
@@ -660,7 +735,7 @@ inline bool flatten(MPI_Datatype dt, size_t count, uint64_t& bytes, std::vector<
         MPI_Type_get_envelope(old, &a, &b, &d, &ocomb);
     }
     if (ocomb != MPI_COMBINER_NAMED)
-        throw std::runtime_error("--transport ucp: indexed datatypes of derived types are not supported");
+        throw std::runtime_error(std::string(opt_name()) + ": indexed datatypes of derived types are not supported");
     MPI_Aint olb = 0, oext = 0, lb = 0, ext = 0;
     MPI_Type_get_extent(old, &olb, &oext);
     MPI_Type_get_extent(dt, &lb, &ext);
@@ -690,7 +765,7 @@ inline uint64_t arena_off(const void* p, uint64_t bytes)
     Engine& e = eng();
     if (bytes == 0) return 0;
     if (!e.alloc.contains(p) || !e.alloc.contains((const char*)p + bytes - 1))
-        throw std::runtime_error("--transport ucp: buffer is not in the registered device arena");
+        throw std::runtime_error(std::string(opt_name()) + ": buffer is not in the device arena");
     return (uint64_t)((const char*)p - e.arena);
 }
 
@@ -754,7 +829,7 @@ inline int isend(Comm* c, const void* buf, size_t count, MPI_Datatype dt, int pe
     if (flatten(dt, count, bytes, blocks) && bytes > 0) {
         char* scratch = (char*)mem::device_alloc(bytes);
         e.deferred.push_back(scratch);
-        ucpk::launch_blocks(e.stream, (const char*)buf, scratch, stage_blocks(blocks), (uint32_t)(blocks.size() / 2), 1);
+        osk::launch_blocks(e.stream, (const char*)buf, scratch, stage_blocks(blocks), (uint32_t)(blocks.size() / 2), 1);
         ++e.n_kernels;
         h.op.off = arena_off(scratch, bytes);
     } else {
@@ -764,7 +839,7 @@ inline int isend(Comm* c, const void* buf, size_t count, MPI_Datatype dt, int pe
     h.op.len = bytes;
     h.op.got = 0;
     h.op.comm = c->d;
-    h.op.kind = ucpp::OP_SEND;
+    h.op.kind = osp::OP_SEND;
     h.op.peer = (uint32_t)peer;
     h.op.tag = (uint32_t)tag;
     h.op.done = 0;
@@ -798,7 +873,7 @@ inline int irecv(Comm* c, void* buf, size_t count, MPI_Datatype dt, int peer, in
     h.op.len = bytes; /* capacity */
     h.op.got = 0;
     h.op.comm = c->d;
-    h.op.kind = ucpp::OP_RECV;
+    h.op.kind = osp::OP_RECV;
     h.op.peer = (uint32_t)peer;
     h.op.tag = (uint32_t)tag;
     h.op.done = 0;
@@ -808,7 +883,7 @@ inline int irecv(Comm* c, void* buf, size_t count, MPI_Datatype dt, int peer, in
     ++e.n_recv;
     append_recv(h.dev);
     /* tell the sender where to put it, right away (or as soon as a slot frees) */
-    ucpk::launch_rts(e.stream, e.g, e.d_recvs, e.nrecv, e.d_cursor);
+    osk::launch_rts(e.stream, e.g, e.d_recvs, e.nrecv, e.d_cursor);
     ++e.n_kernels;
     mem::mark_pending();
     return (int)e.ops.size() - 1;
@@ -822,12 +897,12 @@ inline void wait(const int* idx, int n)
     mem::before_stream_op();
     std::vector<Op*> v((size_t)n);
     for (int i = 0; i < n; ++i) v[(size_t)i] = e.ops[(size_t)idx[i]].dev;
-    ucpk::launch_progress(e.stream, e.g, stage_ptrs(v), (uint32_t)n, e.d_recvs, e.nrecv, e.d_cursor);
+    osk::launch_progress(e.stream, e.g, stage_ptrs(v), (uint32_t)n, e.d_recvs, e.nrecv, e.d_cursor);
     ++e.n_kernels;
     for (int i = 0; i < n; ++i) {
         HostOp& h = e.ops[(size_t)idx[i]];
         if (h.unpack_dst) {
-            ucpk::launch_blocks(e.stream, h.scratch, h.unpack_dst, h.dev_blocks, h.nblocks, 0);
+            osk::launch_blocks(e.stream, h.scratch, h.unpack_dst, h.dev_blocks, h.nblocks, 0);
             ++e.n_kernels;
         }
     }
@@ -854,19 +929,24 @@ inline std::string describe_error(uint64_t code, uint64_t info)
 {
     const unsigned peer = (unsigned)(info >> 32), low = (unsigned)(info & 0xffffffffu);
     switch (code) {
-        case ucpp::ERR_TAG:
+        case osp::ERR_TAG:
             return "message from/to communicator rank " + std::to_string(peer) + " does not match the posted " +
                    "receive (tag " + std::to_string(low) + "): the two sides post their messages in different orders";
-        case ucpp::ERR_TRUNCATE:
+        case osp::ERR_TRUNCATE:
             return "message to communicator rank " + std::to_string(peer) + " is larger than the posted receive";
-        case ucpp::ERR_TIMEOUT:
+        case osp::ERR_TIMEOUT:
             return std::string("timeout waiting for communicator rank ") + std::to_string(peer) +
                    (low == 1 ? " to consume earlier messages before a receive could be posted"
                              : low == 2 ? " to post its receive" : " to deliver data") +
-                   " (--ucp-timeout)";
-        case ucpp::ERR_UCX:
+                   " (" + opt("timeout") + ")";
+        case osp::ERR_XPORT:
+#if defined(COLLAGE_OS_UCX)
             return "UCX device operation to communicator rank " + std::to_string(peer) + " failed: " +
                    ucs_status_string((ucs_status_t)(-(int)low));
+#else
+            return "device operation to communicator rank " + std::to_string(peer) + " failed (" +
+                   std::to_string(low) + ")";
+#endif
         default:
             return "unknown error " + std::to_string(code);
     }
@@ -880,7 +960,7 @@ inline void after_drain()
     if (e.err_host[0]) {
         const uint64_t code = e.err_host[0], info = e.err_host[1];
         e.err_host[0] = e.err_host[1] = 0;
-        throw std::runtime_error("--transport ucp: " + describe_error(code, info));
+        throw std::runtime_error(std::string(opt_name()) + ": " + describe_error(code, info));
     }
     for (void* p : e.deferred) mem::device_free(p);
     e.deferred.clear();
@@ -893,7 +973,7 @@ inline void after_drain()
     e.blk_ring.reset();
 }
 
-} // namespace ucpx
+} // namespace osx
 
-#endif /* COLLAGE_ST_UCP */
-#endif /* COLLAGE_UCP_TRANSPORT_HPP */
+#endif /* COLLAGE_ST_UCP || COLLAGE_ST_NVSHMEM */
+#endif /* COLLAGE_ONESIDED_TRANSPORT_HPP */

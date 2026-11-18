@@ -1,4 +1,4 @@
-# COLLAGE — COLLective AlGorithms bEnchmark
+# collage — point-to-point collective algorithm benchmark
 
 `collage` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
@@ -20,8 +20,8 @@ HPC ahead.
 |---|---|
 | `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware p2p wrappers, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
-| `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs, or device-initiated one-sided UCX (`--transport`) |
-| `ucp_transport.hpp`, `ucp_proto.hpp`, `ucp_device_ops.hpp`, `ucp_device.cu` | `--transport ucp`: UCX GPU device API engine (host setup), shared layouts, the GPU protocol, and its kernels |
+| `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs, or device-initiated one-sided UCX or NVSHMEM (`--transport`) |
+| `onesided_transport.hpp`, `onesided_proto.hpp`, `onesided_device_ops.hpp`, `onesided_device.cu` | `--transport ucp` and `--transport shmem`: the device-initiated one-sided engine (host setup per back end: UCX or NVSHMEM), shared layouts, the GPU protocol (one copy, a few primitives per back end), and its kernels |
 | `memory.hpp` | memory layer: host/GPU space, `Buf<T>` temporaries with a caching device allocator, overlap-safe copies, reduction dispatch |
 | `gpu_ops.hpp`, `gpu_reduce.cu` | element-wise reduction operators and their CUDA kernels (built with `make CUDA=1`) |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
@@ -49,6 +49,7 @@ make CUDA=1 ST=cray     # + stream-triggered transport, see "Stream-triggered tr
 make CUDA=1 ST=mpich    #   (one of cray, mpich, acx per binary; mpi is always there)
 make CUDA=1 ST=acx ACX_HOME=$HOME/mpi-acx CUDA_ARCH=-arch=sm_80
 make CUDA=1 ST=ucp UCX_HOME=/opt/ucx CUDA_ARCH=-arch=sm_90   # device-initiated UCX (--transport ucp)
+make CUDA=1 ST=nvshmem NVSHMEM_HOME=/opt/nvshmem CUDA_ARCH=-arch=sm_90   # device-initiated NVSHMEM (--transport shmem)
 ```
 
 With an MPI-4 library, all counts go through the `MPI_*_c` large-count calls.
@@ -104,13 +105,13 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
 | `--gpu-reduce MODE` | local reductions on GPU data: `kernel`, `mpi` or `host` (see below) | `kernel` |
 | `--assume-cuda-aware` | use device buffers even if the library does not report CUDA awareness | off |
-| `--transport T` | with `--gpu`: `mpi` (CUDA-aware MPI, host-driven), or stream-triggered `cray`, `mpich`, `acx` (needs a binary built with `ST=T`) | `mpi` |
-| `--st-peers P` | stream-triggered transports: `inter` = queue only messages to other nodes, `all` = every message | `inter` |
+| `--transport T` | with `--gpu`: `mpi` (CUDA-aware MPI, host-driven), stream-triggered `cray`, `mpich`, `acx`, or device-initiated one-sided `ucp`, `shmem` (needs a binary built with `ST=T`; `shmem` with `ST=nvshmem`) | `mpi` |
+| `--st-peers P` | stream-triggered and one-sided transports: `inter` = queue only messages to other nodes, `all` = every message | `inter` (`ucp`, `shmem`: `all`) |
 | `--mpich-progress-thread` | `--transport mpich`: start MPICH's stream progress thread | off |
 | `--thread-multiple` | initialise MPI with `MPI_THREAD_MULTIPLE` for the plain transport too | off |
-| `--ucp-heap BYTES` | `--transport ucp`: registered device arena per rank (all buffers live in it) | `4G` |
-| `--ucp-slots R` | `--transport ucp`: receives in flight per peer (receiver-ready ring depth) | `16` |
-| `--ucp-timeout S` | `--transport ucp`: GPU-side timeout, reported as an error instead of a hang | `60` |
+| `--ucp-heap BYTES` (`--shmem-heap`) | `--transport ucp`/`shmem`: device arena per rank, registered with UCX or on the NVSHMEM symmetric heap (all buffers live in it) | `4G` |
+| `--ucp-slots R` (`--shmem-slots`) | `--transport ucp`/`shmem`: receives in flight per peer (receiver-ready ring depth) | `16` |
+| `--ucp-timeout S` (`--shmem-timeout`) | `--transport ucp`/`shmem`: GPU-side timeout, reported as an error instead of a hang | `60` |
 
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
@@ -328,7 +329,7 @@ algorithms themselves are unchanged. All the transport-specific code is in
 | `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
 | `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
 | `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
-| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) over any MPI | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
 
 * **Only messages to other nodes are queued** (`--st-peers inter`, the
   default). Messages to peers on the same node keep CUDA-aware MPI, which
@@ -400,21 +401,34 @@ algorithms themselves are unchanged. All the transport-specific code is in
   `plots/plot_collage.py --kind transport` plots the speedup of each transport
   over `mpi`.
 
-### Device-initiated one-sided transport (`--transport ucp`)
+### Device-initiated one-sided transports (`--transport ucp`, `--transport shmem`)
 
 ```bash
-make CUDA=1 ST=ucp UCX_HOME=/opt/ucx CUDA_ARCH=-arch=sm_90   # UCX >= 1.20 built --with-cuda
+# UCX >= 1.20 built --with-cuda (GDA on ConnectX)
+make CUDA=1 ST=ucp UCX_HOME=/opt/ucx CUDA_ARCH=-arch=sm_90
 mpirun -np 64 -x UCX_TLS=rc_gda,cuda_ipc,rc,self ./collage -c allreduce --gpu --transport ucp --check
+
+# NVSHMEM (3.x: libnvshmem_host + libnvshmem_device; 2.x: NVSHMEM_LIBS=-lnvshmem)
+make CUDA=1 ST=nvshmem NVSHMEM_HOME=/opt/nvshmem CUDA_ARCH=-arch=sm_90
+mpirun -np 64 -x NVSHMEM_IB_ENABLE_IBGDA=1 ./collage -c allreduce --gpu --transport shmem --check
 ```
 
 The stream-triggered transports above still leave MPI, and the host CPU that
-progresses it, in the path of every message. `--transport ucp` removes both.
-After a bootstrap through MPI, the **GPU issues every transfer and every
-signal itself**, using UCX's GPU device API (UCP device API, UCX 1.20 and
-later). On ConnectX InfiniBand/RoCE these are GPUDirect-Async (`rc_gda`)
-writes and atomics rung from the kernel. Peers on the same node use UCX's
-CUDA-IPC lanes. The host only launches kernels; no MPI call and no host
-progress happen while a collective runs.
+progresses it, in the path of every message. These two remove both. After a
+bootstrap through MPI, the **GPU issues every transfer and every signal
+itself**; the host only launches kernels, and no MPI call and no host progress
+happen while a collective runs. They share one protocol and one engine and
+differ only in the library underneath (a build-time choice, `ST=ucp` or
+`ST=nvshmem`):
+
+| | `ucp` | `shmem` |
+|---|---|---|
+| library | UCX GPU device API (UCP device API, UCX >= 1.20) | NVSHMEM device API |
+| network | GPUDirect-Async (`rc_gda`) on ConnectX InfiniBand/RoCE | IBGDA on ConnectX (`NVSHMEM_IB_ENABLE_IBGDA=1`); otherwise NVSHMEM's proxy transports (IB/RoCE, or libfabric on Slingshot, where a host proxy thread posts the GPU's operations) |
+| same node | UCX CUDA-IPC lanes | NVLink/PCIe peer access to the symmetric heap |
+| arena | `cudaMalloc` + `ucp_mem_map`, rkeys exchanged once | one `nvshmem_malloc` (symmetric: no keys) |
+| "data before signal" | wait for each put to complete, then increment | put-with-signal (`nvshmemx_putmem_signal_nbi_block`), a fence between length and payload, and one `nvshmem_quiet` per pass of the kernel |
+| run header | UCX device API generation | NVSHMEM version, `NVSHMEM_REMOTE_TRANSPORT`, `NVSHMEM_IB_ENABLE_IBGDA` |
 
 The algorithms are the same code. Their `send`/`recv`/`isend`/`irecv`/`wait`
 become a zero-copy rendezvous made of one-sided operations:
@@ -422,40 +436,42 @@ become a zero-copy rendezvous made of one-sided operations:
 | step | who | operation |
 |---|---|---|
 | receive posted | receiver GPU | put a receiver-ready descriptor {arena offset, capacity, tag} into the sender's control area, then increment the sender's ready counter |
-| send completes | sender GPU | wait for the ready counter, put the payload straight into the receiver's buffer, put its length, wait for both puts to complete, then increment the receiver's data counter |
+| send completes | sender GPU | wait for the ready counter, put the length and the payload straight into the receiver's buffer, then increment the receiver's data counter, ordered after both puts |
 | receive completes | receiver GPU | wait for the data counter |
 
-* **One registered arena per rank** (`--ucp-heap`). The device memory pool
-  draws from it, so every buffer an algorithm uses (the user buffers and all
-  temporaries) is reachable by peers as an offset into the peer's arena. There
-  is no per-message registration or rkey, just one `ucp_mem_map` and one rkey
-  exchange at start-up. `--max-mem` and the arena size must agree; the footer
-  reports the arena's peak use.
+* **One arena per rank** (`--ucp-heap`, alias `--shmem-heap`). The device
+  memory pool draws from it, so every buffer an algorithm uses (the user
+  buffers and all temporaries) is reachable by peers as an offset into the
+  peer's arena. There is no per-message registration. `--max-mem` and the
+  arena size must agree; the footer reports the arena's peak use. shmem sets
+  `NVSHMEM_SYMMETRIC_SIZE` to the arena plus 256 MiB unless it is already set.
 * **Matching.** Message k from s to r matches receive k from s at r: both
   sides count in program order. The tag travels with the descriptor and the
   sender checks it, so a mismatch is reported as an error, not silently
-  delivered to the wrong buffer. Up to `--ucp-slots` receives per peer may be
-  in flight; a receiver waits before reusing a ring slot. Each communicator
-  (each `CollBase`) has its own control area: two counters and four small rings
-  per peer, about 1 KiB per peer with 16 slots.
+  delivered to the wrong buffer. Up to `--ucp-slots` (`--shmem-slots`)
+  receives per peer may be in flight; a receiver waits before reusing a ring
+  slot. Each communicator (each `CollBase`) has its own control area: two
+  counters and four small rings per peer, about 1 KiB per peer with 16 slots.
 * **Kernels.** `irecv` launches a receiver-ready kernel at once (so the
   sender is never kept waiting by the receiver's host). `isend` only records
   the operation. `wait`/`waitall` launch one progress kernel, which completes
   whichever of its operations is ready first, like `MPI_Waitall`.
   `MPI_Waitany` follows the stream transports' rule (all active requests,
-  reported one per call). Kernels are one block of 128 threads and call UCX at
-  the block cooperation level.
+  reported one per call). Kernels are one block of 128 threads; communication
+  calls are block-cooperative (UCX block level, NVSHMEM `*_block`).
 * **Derived datatypes** (the indexed types of Bruck & co.) are flattened on
   the host. A pack kernel gathers a send into contiguous arena scratch, and an
   unpack kernel scatters a receive after it completes.
 * **Status and errors.** Receive counts (`MPI_Get_count`) come from the
   length the sender put. Tag mismatches, truncation, UCX errors and timeouts
-  (`--ucp-timeout`, so a protocol deadlock reports instead of hanging) are
-  written by the GPU to mapped host memory and raised at the end of the call.
-* **Peer scope.** All peers, including those on the same node, go through UCX
-  by default. `--st-peers inter` keeps on-node peers on CUDA-aware MPI (the
-  host then waits for the stream before those calls, as with the other
-  transports). The CSV `transport` column reads `ucp`, or `ucp:inter`.
+  (`--ucp-timeout`/`--shmem-timeout`, so a protocol deadlock reports instead
+  of hanging) are written by the GPU to mapped host memory and raised at the
+  end of the call.
+* **Peer scope.** All peers, including those on the same node, go through the
+  one-sided transport by default. `--st-peers inter` keeps on-node peers on
+  CUDA-aware MPI (the host then waits for the stream before those calls, as
+  with the other transports). The CSV `transport` column reads `ucp`/`shmem`,
+  or `ucp:inter`/`shmem:inter`.
 * **Not applicable:** barrier `linear` (a wildcard receive cannot be matched
   in program order).
 * **UCX versions.** The device API changed after 1.20.
@@ -466,17 +482,28 @@ become a zero-copy rendezvous made of one-sided operations:
     `ucp_device_put`).
   * collage picks the right one from `UCP_API_VERSION`, and the run header
     says which.
-* **Ordering assumption.** UCX documents no ordering between a put and a
-  later counter increment. collage therefore waits for each put to complete
-  (`ucp_device_progress_req`) before it increments the peer's counter. That
-  costs one completion round trip per message, a cost an eager protocol or a
-  documented put-with-signal could remove.
-* **Requirements.** UCX built `--with-cuda`, with its GDA transport
-  for the network (a ConnectX NIC UCX supports for GDA, plus `nvidia_peermem`;
-  UCX 1.20 checks for it). A GPU-aware UCX
-  configuration must offer device lanes; otherwise setup stops with "UCX found
-  no GPU device lanes". This transport does not apply to Slingshot: UCX has no
-  device lanes there, so on Perlmutter use `cray`.
+* **Ordering.** UCX documents no ordering between a put and a later counter
+  increment, so `ucp` waits for each put to complete
+  (`ucp_device_progress_req`) before it increments the peer's counter: one
+  completion round trip per message. `shmem` relies on NVSHMEM's documented
+  put-with-signal ordering instead and completes its operations once per
+  kernel pass (`nvshmem_quiet`), so puts to several peers overlap.
+* **Requirements, ucp.** UCX built `--with-cuda`, with its GDA transport for
+  the network (a ConnectX NIC UCX supports for GDA, plus `nvidia_peermem`;
+  UCX 1.20 checks for it). A GPU-aware UCX configuration must offer device
+  lanes; otherwise setup stops with "UCX found no GPU device lanes". UCX has
+  no device lanes on Slingshot.
+* **Requirements, shmem.** NVSHMEM with its MPI bootstrap plugin built
+  against the MPI collage uses (collage initialises NVSHMEM with
+  `NVSHMEMX_INIT_WITH_MPI_COMM` on a duplicate of `MPI_COMM_WORLD`, so PE =
+  world rank). The kernels are compiled with `-rdc=true` and device-linked
+  with `libnvshmem_device`, for the architecture in `CUDA_ARCH` (default
+  `sm_80`). Only `onesided_device.cu` includes the NVSHMEM headers. IBGDA needs
+  a ConnectX NIC and `NVSHMEM_IB_ENABLE_IBGDA=1`; without it NVSHMEM falls back
+  to its proxy thread, which is still device-initiated from the kernel's point
+  of view but host-posted on the wire. On Perlmutter (Slingshot), `shmem` runs
+  through NVSHMEM's libfabric transport with that proxy: a device-API
+  comparison point next to `cray`, not IBGDA.
 
 ## Reduction operations
 
@@ -537,11 +564,61 @@ sub-algorithms, so nothing reaches the MPI library's collectives:
 
 To use different sub-steps, change the corresponding line in the header.
 
+## Changes relative to the draft and to upstream
+
+The draft headers were partly copied Open MPI source (`MCA_PML_CALL`,
+`ompi_datatype_*`, `goto err_hndl`) and partly unfinished ports. `utils.hpp`
+was only present as a vim swap file. Everything was rewritten against the
+upstream sources at the commit above, keeping control flow and message
+schedules identical. These are the changes:
+
+* **Buffers are typed, counts are elements.** Every algorithm takes `T*`
+  buffers and `size_t` counts/displacements. The draft computed offsets as
+  `(T*)buf + i * count * sizeof(T)`, which scales by `sizeof(T)` twice. It also
+  had separate send/recv types `U`/`T`; one element type is used now.
+* **Packing and datatype copies became `memcpy`.** `opal_convertor_pack` (the
+  in-place alltoall(v)), `ompi_datatype_sndrcv` and
+  `ompi_datatype_copy_content_same_ddt` are equivalent to `memcpy` for
+  contiguous predefined types. Indexed datatypes are still built with
+  `MPI_Type_indexed(_c)` where upstream uses them (alltoall bruck, allgatherv
+  bruck / neighborexchange / basic_default, reduce_scatter_block
+  recursivedoubling).
+* **Persistent requests are freed.** Linear alltoall(v) now calls
+  `MPI_Request_free` on its persistent requests after `MPI_Waitall`. The draft
+  leaked them.
+* **Sparbit tags are non-negative.** Sparbit uses `TAG_BASE + block` instead of
+  upstream's negative internal tag space. At very large scale,
+  `1000 + size` must not exceed `MPI_TAG_UB`. MPI guarantees at least 32767,
+  and real implementations allow far more.
+* **Signed arithmetic in bcast scatter_allgather(_ring).** At this commit,
+  upstream uses `size_t` for `recv_count`/`send_count` and then tests
+  `<= 0` / `< 0`. That can underflow when blocks run past the end of the
+  buffer. The port uses signed 64-bit counts, which is what the code intends.
+* **Zero-size messages run the algorithm.** MPI libraries return early for
+  most collectives at count 0. Here, the 0-byte row runs each algorithm with
+  empty messages, which measures its latency term. Segmented algorithms use one
+  empty segment, and leaf processes in segmented reduce always send at least
+  one message, so the tree never deadlocks. The exceptions are algorithms
+  where upstream itself returns early for zero counts (`reduce_scatter_block`
+  and reduce_scatter `recursivehalving`).
+* **`TypeMap<long>` fixed.** The draft mapped `long` to `MPI_LONG_INT`, which
+  is a pair type. The type map now uses fixed-width `MPI_INT*_T`/`MPI_UINT*_T`.
+* **Errors abort, unsupported cases throw.** Errors go through `MPI_CHECK`,
+  which reports file and line and aborts. Algorithms that can't run in a given
+  configuration throw `NotApplicable`, and the harness reports `n/a`.
+
 ## Verification
 
 `--check` runs the native MPI collective once per size to build the
 reference. It then re-initialises the inputs, runs each algorithm once on
-poisoned output buffers, and compares the result element by element.
+poisoned output buffers, and compares the result element by element. The
+comparison covers the root for rooted collectives and every rank otherwise.
+Inputs are small integers chosen per operation, so floating-point sums and
+products are exact whatever the reduction order.
+
+The full matrix was run with MPICH 4.2.3 and passed. It covered 1–8 ranks, all
+collectives and algorithms, all operations, several types, roots, segment
+sizes, radices, request limits and count distributions.
 
 ## Cost model
 
@@ -551,13 +628,13 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Studies on Perlmutter
+## Job scripts
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and
 algorithm tunables (`tunables`). `plots/plot_collage.py` turns their CSV
 output into figures. Build, submission and plotting are described in
-[scripts/README.md](scripts/README.md).
+[scripts/README.md](perlmutter/README.md).
 
 ## License
 
@@ -565,5 +642,5 @@ collage is distributed under the 3-clause BSD license. The algorithm headers
 are derived from Open MPI and also carry Open MPI's BSD license and copyright
 notices. See [LICENSE](LICENSE) for both.
 
-collage can be built against UCX, MPI-ACX, MPICH or Cray MPICH, and CUDA, each 
-under its own license and none of them included.
+collage can be built against UCX (BSD-3-Clause), MPI-ACX, MPICH or Cray MPICH, 
+NVSHMEM, and CUDA, each under its own license and none of them included.

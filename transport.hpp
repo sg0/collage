@@ -5,7 +5,7 @@
 /*
  * Transport layer: how the point-to-point messages of the algorithms are
  * issued. Selected at run time with --transport (stream-triggered ones only
- * with --gpu), compiled in with `make CUDA=1 ST=mpich|acx|cray`.
+ * with --gpu), compiled in with `make CUDA=1 ST=mpich|acx|cray|ucp|nvshmem`.
  *
  *   mpi    plain (CUDA-aware) MPI, host-driven; the default. Every device
  *          copy/kernel is waited for before the next MPI call.
@@ -18,11 +18,14 @@
  *   cray   HPE Cray MPICH stream-triggered (ST) operations on Slingshot:
  *          MPIX_Queue bound to our CUDA stream, MPIX_Enqueue_{send,recv},
  *          MPIX_Enqueue_start (trigger), MPIX_Enqueue_wait.
- *   ucp    UCX GPU device API (UCX >= 1.20, ucp_transport.hpp): no MPI after
+ *   ucp    UCX GPU device API (UCX >= 1.20, onesided_transport.hpp): no MPI after
  *          bootstrap; GPU kernels issue one-sided puts and remote counter
  *          increments themselves (GDA on ConnectX InfiniBand/RoCE, CUDA IPC
  *          on a node). Every send/recv is a rendezvous of device-initiated
- *          puts (see ucp_proto.hpp).
+ *          puts (see onesided_proto.hpp).
+ *   shmem  NVSHMEM device API (build ST=nvshmem): the same protocol on
+ *          put-with-signal (IBGDA on ConnectX, NVLink/P2P on a node, or a
+ *          proxy transport such as libfabric on Slingshot).
  *
  * With a stream-triggered transport an algorithm runs *in stream order*: its
  * sends, receives and waits are queued on the CUDA stream together with the
@@ -83,10 +86,14 @@
 
 #include "memory.hpp"
 
-#if (defined(COLLAGE_ST_MPICH) + defined(COLLAGE_ST_ACX) + defined(COLLAGE_ST_CRAY) + defined(COLLAGE_ST_UCP)) > 1
-#error "build with at most one stream-triggered transport (ST=mpich, ST=acx, ST=cray or ST=ucp)"
+#if (defined(COLLAGE_ST_MPICH) + defined(COLLAGE_ST_ACX) + defined(COLLAGE_ST_CRAY) + defined(COLLAGE_ST_UCP) + \
+     defined(COLLAGE_ST_NVSHMEM)) > 1
+#error "build with at most one stream-triggered transport (ST=mpich, ST=acx, ST=cray, ST=ucp or ST=nvshmem)"
 #endif
-#if (defined(COLLAGE_ST_MPICH) || defined(COLLAGE_ST_ACX) || defined(COLLAGE_ST_CRAY) || defined(COLLAGE_ST_UCP)) && \
+#if defined(COLLAGE_ST_UCP) || defined(COLLAGE_ST_NVSHMEM)
+#define COLLAGE_ONESIDED 1 /* a device-initiated one-sided transport (onesided_transport.hpp) */
+#endif
+#if (defined(COLLAGE_ST_MPICH) || defined(COLLAGE_ST_ACX) || defined(COLLAGE_ST_CRAY) || defined(COLLAGE_ONESIDED)) && \
     !defined(COLLAGE_CUDA)
 #error "stream-triggered transports need GPU support (make CUDA=1 ST=...)"
 #endif
@@ -96,8 +103,8 @@
 #if defined(COLLAGE_ST_ACX)
 #include <mpi-acx.h>
 #endif
-#if defined(COLLAGE_ST_UCP)
-#include "ucp_transport.hpp"
+#if defined(COLLAGE_ONESIDED)
+#include "onesided_transport.hpp"
 #endif
 
 /* Cray MPICH: the documented synopsis is MPIX_Create_queue(stream, &queue);
@@ -114,7 +121,10 @@
 
 namespace xport {
 
-enum class Kind { Mpi, Mpich, Acx, Cray, Ucp };
+enum class Kind { Mpi, Mpich, Acx, Cray, Ucp, Shmem };
+
+/* device-initiated one-sided transports (no MPI after bootstrap) */
+inline bool onesided(Kind k) { return k == Kind::Ucp || k == Kind::Shmem; }
 
 inline const char* kind_name(Kind k)
 {
@@ -124,6 +134,7 @@ inline const char* kind_name(Kind k)
         case Kind::Acx: return "acx";
         case Kind::Cray: return "cray";
         case Kind::Ucp: return "ucp";
+        case Kind::Shmem: return "shmem";
     }
     return "?";
 }
@@ -135,6 +146,7 @@ inline bool parse_kind(const std::string& s, Kind& k)
     else if (s == "acx") k = Kind::Acx;
     else if (s == "cray") k = Kind::Cray;
     else if (s == "ucp") k = Kind::Ucp;
+    else if (s == "shmem") k = Kind::Shmem;
     else return false;
     return true;
 }
@@ -156,6 +168,9 @@ inline bool kind_built(Kind k)
 #if defined(COLLAGE_ST_UCP)
         case Kind::Ucp: return true;
 #endif
+#if defined(COLLAGE_ST_NVSHMEM)
+        case Kind::Shmem: return true;
+#endif
         default: return false;
     }
 }
@@ -163,7 +178,7 @@ inline bool kind_built(Kind k)
 inline std::string built_list()
 {
     std::string s = "mpi";
-    for (Kind k : {Kind::Mpich, Kind::Acx, Kind::Cray, Kind::Ucp})
+    for (Kind k : {Kind::Mpich, Kind::Acx, Kind::Cray, Kind::Ucp, Kind::Shmem})
         if (kind_built(k)) s += std::string(", ") + kind_name(k);
     return s;
 }
@@ -181,7 +196,7 @@ struct Request {
     void* x = nullptr;                /* Enq for acx (MPIX_Request) */
     Persist* p = nullptr;             /* Pers: emulated persistent request */
     int q = -1;                       /* Enq for cray: index of its queue */
-    int u = -1;                       /* Enq for ucp: index of its operation */
+    int u = -1;                       /* Enq for ucp/shmem: index of its operation */
 };
 
 inline bool operator==(const Request& a, const Request& b)
@@ -226,11 +241,11 @@ struct State {
     /* receive statuses filled by the stream: user status -> our storage */
     std::deque<MPI_Status> slots;
     std::unordered_map<const MPI_Status*, MPI_Status*> slot_of;
-#if defined(COLLAGE_ST_UCP)
-    std::unordered_map<const MPI_Status*, int> ucp_status_of; /* receive status -> operation */
-    size_t ucp_heap = (size_t)4 << 30;
-    uint32_t ucp_slots = 16;
-    double ucp_timeout = 60.0;
+#if defined(COLLAGE_ONESIDED)
+    std::unordered_map<const MPI_Status*, int> os_status_of; /* receive status -> operation */
+    size_t os_heap = (size_t)4 << 30;
+    uint32_t os_slots = 16;
+    double os_timeout = 60.0;
 #endif
     /* statistics */
     unsigned long long enqueued = 0, plain = 0, host_waits = 0, drains = 0;
@@ -256,8 +271,8 @@ inline bool large_count()
  * progress thread) while the main thread keeps issuing MPI calls */
 inline int required_thread_level(Kind k)
 {
-    /* ucp: MPI is only the bootstrap, called from the main thread */
-    return (k == Kind::Mpi || k == Kind::Ucp) ? MPI_THREAD_SINGLE : MPI_THREAD_MULTIPLE;
+    /* ucp/shmem: MPI is only the bootstrap, called from the main thread */
+    return (k == Kind::Mpi || onesided(k)) ? MPI_THREAD_SINGLE : MPI_THREAD_MULTIPLE;
 }
 
 inline int icount(size_t c)
@@ -343,8 +358,8 @@ inline void configure(Kind k, bool all_peers, bool progress_thread)
 #if defined(COLLAGE_ST_CRAY)
     /* cray: queues are created on demand (cray_queue()) */
 #endif
-#if defined(COLLAGE_ST_UCP)
-    if (k == Kind::Ucp) ucpx::init(s.ucp_heap, s.ucp_slots, s.ucp_timeout, s.stream);
+#if defined(COLLAGE_ONESIDED)
+    if (onesided(k)) osx::init(s.os_heap, s.os_slots, s.os_timeout, s.stream);
 #endif
     mem::st().async = true;
     mem::st().before_stream_op = &flush_hook;
@@ -375,8 +390,8 @@ inline void shutdown()
         s.queues_used = 0;
     }
 #endif
-#if defined(COLLAGE_ST_UCP)
-    if (s.kind == Kind::Ucp) ucpx::finalize();
+#if defined(COLLAGE_ONESIDED)
+    if (onesided(s.kind)) osx::finalize();
 #endif
     mem::st().async = false;
     mem::st().before_stream_op = nullptr;
@@ -402,9 +417,9 @@ inline void drain()
     s.held_types.clear();
     s.slots.clear();
     s.slot_of.clear();
-#if defined(COLLAGE_ST_UCP)
-    s.ucp_status_of.clear();
-    if (s.kind == Kind::Ucp) ucpx::after_drain(); /* raises errors the GPU reported */
+#if defined(COLLAGE_ONESIDED)
+    s.os_status_of.clear();
+    if (onesided(s.kind)) osx::after_drain(); /* raises errors the GPU reported */
 #endif
     ++s.drains;
 }
@@ -479,15 +494,15 @@ public:
             own_ = true;
         }
 #endif
-#if defined(COLLAGE_ST_UCP)
-        if (st().kind == Kind::Ucp) uc_ = ucpx::comm_open(comm); /* control area */
+#if defined(COLLAGE_ONESIDED)
+        if (onesided(st().kind)) uc_ = osx::comm_open(comm); /* control area */
 #endif
     }
     void close()
     {
-#if defined(COLLAGE_ST_UCP)
+#if defined(COLLAGE_ONESIDED)
         if (uc_) {
-            ucpx::comm_close(uc_);
+            osx::comm_close(uc_);
             uc_ = nullptr;
         }
 #endif
@@ -509,8 +524,8 @@ public:
     MPI_Comm comm() const { return comm_; }   /* plain path */
     MPI_Comm scomm() const { return scomm_; } /* stream path */
     int remote_peers() const { return nremote_; }
-#if defined(COLLAGE_ST_UCP)
-    ucpx::Comm* ucomm() const { return uc_; }
+#if defined(COLLAGE_ONESIDED)
+    osx::Comm* ocomm() const { return uc_; }
 #endif
 
 private:
@@ -518,8 +533,8 @@ private:
     std::vector<char> remote_;
     int nremote_ = 0;
     bool own_ = false;
-#if defined(COLLAGE_ST_UCP)
-    ucpx::Comm* uc_ = nullptr;
+#if defined(COLLAGE_ONESIDED)
+    osx::Comm* uc_ = nullptr;
 #endif
 };
 
@@ -576,14 +591,14 @@ inline void enq_isend(const Channel& ch, const void* buf, size_t count, MPI_Data
                       Request* r)
 {
     State& s = st();
-#if !defined(COLLAGE_ST_UCP)
-    dt = hold_type(dt); /* (ucp flattens the type at once) */
+#if !defined(COLLAGE_ONESIDED)
+    dt = hold_type(dt); /* (ucp/shmem flatten the type at once) */
 #endif
     *r = Request{};
     r->k = Request::Enq;
     (void)ch; (void)buf; (void)count; (void)dt; (void)dest; (void)tag; (void)s;
-#if defined(COLLAGE_ST_UCP)
-    r->u = ucpx::isend(ch.ucomm(), buf, count, dt, dest, tag);
+#if defined(COLLAGE_ONESIDED)
+    r->u = osx::isend(ch.ocomm(), buf, count, dt, dest, tag);
 #elif defined(COLLAGE_ST_MPICH)
 #if defined(MPI_VERSION) && MPI_VERSION >= 4 && !defined(COLLAGE_NO_LARGE_COUNT)
     MPI_CHECK(MPIX_Isend_enqueue_c(buf, (MPI_Count)count, dt, dest, tag, ch.scomm(), &r->h));
@@ -606,14 +621,14 @@ inline void enq_isend(const Channel& ch, const void* buf, size_t count, MPI_Data
 inline void enq_irecv(const Channel& ch, void* buf, size_t count, MPI_Datatype dt, int src, int tag, Request* r)
 {
     State& s = st();
-#if !defined(COLLAGE_ST_UCP)
+#if !defined(COLLAGE_ONESIDED)
     dt = hold_type(dt);
 #endif
     *r = Request{};
     r->k = Request::Enq;
     (void)ch; (void)buf; (void)count; (void)dt; (void)src; (void)tag; (void)s;
-#if defined(COLLAGE_ST_UCP)
-    r->u = ucpx::irecv(ch.ucomm(), buf, count, dt, src, tag);
+#if defined(COLLAGE_ONESIDED)
+    r->u = osx::irecv(ch.ocomm(), buf, count, dt, src, tag);
 #elif defined(COLLAGE_ST_MPICH)
 #if defined(MPI_VERSION) && MPI_VERSION >= 4 && !defined(COLLAGE_NO_LARGE_COUNT)
     MPI_CHECK(MPIX_Irecv_enqueue_c(buf, (MPI_Count)count, dt, src, tag, ch.scomm(), &r->h));
@@ -638,9 +653,9 @@ inline void enq_wait(Request* r, MPI_Status* user_status)
 {
     State& s = st();
     (void)s;
-#if defined(COLLAGE_ST_UCP)
-    ucpx::wait(&r->u, 1);
-    if (user_status != MPI_STATUS_IGNORE) s.ucp_status_of[user_status] = r->u;
+#if defined(COLLAGE_ONESIDED)
+    osx::wait(&r->u, 1);
+    if (user_status != MPI_STATUS_IGNORE) s.os_status_of[user_status] = r->u;
 #elif defined(COLLAGE_ST_MPICH)
     MPI_CHECK(MPIX_Wait_enqueue(&r->h, status_slot(user_status)));
 #elif defined(COLLAGE_ST_ACX)
@@ -665,10 +680,10 @@ inline void enq_waitall(int n, Request** reqs)
     if (n <= 0) return;
     State& s = st();
     (void)s;
-#if defined(COLLAGE_ST_UCP)
+#if defined(COLLAGE_ONESIDED)
     std::vector<int> u((size_t)n);
     for (int i = 0; i < n; ++i) u[(size_t)i] = reqs[i]->u;
-    ucpx::wait(u.data(), n);
+    osx::wait(u.data(), n);
 #elif defined(COLLAGE_ST_MPICH)
     std::vector<MPI_Request> h((size_t)n);
     for (int i = 0; i < n; ++i) h[(size_t)i] = reqs[i]->h;
@@ -696,8 +711,8 @@ inline void forget_status(MPI_Status* user)
 {
     if (user != MPI_STATUS_IGNORE && st().kind != Kind::Mpi) {
         st().slot_of.erase(user);
-#if defined(COLLAGE_ST_UCP)
-        st().ucp_status_of.erase(user);
+#if defined(COLLAGE_ONESIDED)
+        st().os_status_of.erase(user);
 #endif
     }
 }
@@ -709,13 +724,13 @@ inline bool fetch_status(MPI_Status* user)
 {
     State& s = st();
     if (s.kind == Kind::Mpi) return false;
-#if defined(COLLAGE_ST_UCP)
-    if (s.kind == Kind::Ucp) {
-        auto u = s.ucp_status_of.find(user);
-        if (u == s.ucp_status_of.end()) return false;
+#if defined(COLLAGE_ONESIDED)
+    if (onesided(s.kind)) {
+        auto u = s.os_status_of.find(user);
+        if (u == s.os_status_of.end()) return false;
         mem::sync();
-        ucpx::status(u->second, user);
-        s.ucp_status_of.erase(u);
+        osx::status(u->second, user);
+        s.os_status_of.erase(u);
         return true;
     }
 #endif

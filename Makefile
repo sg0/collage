@@ -14,6 +14,9 @@
 #                              + UCX GPU device API (--transport ucp): device-initiated
 #                              one-sided puts; UCX >= 1.20 built --with-cuda (and
 #                              with GDA for ConnectX InfiniBand/RoCE)
+#   make CUDA=1 ST=nvshmem NVSHMEM_HOME=/opt/nvshmem CUDA_ARCH=-arch=sm_90
+#                              + NVSHMEM device API (--transport shmem): the same
+#                              protocol on put-with-signal (IBGDA, NVLink, proxy)
 MPICXX    ?= mpicxx
 CXXFLAGS  ?= -O3 -std=c++17 -Wall -Wextra
 
@@ -70,13 +73,32 @@ UCX_LIB   ?= $(UCX_HOME)/lib
 CXXFLAGS  += -DCOLLAGE_ST_UCP -I$(UCX_HOME)/include
 LDFLAGS   += -L$(UCX_LIB) -Wl,-rpath,$(UCX_LIB)
 LIBS      += -lucp -luct -lucs
-OBJS      += ucp_device.o
+OBJS      += onesided_device.o
 
 # the UCX device API is header-only CUDA code (GDA and CUDA-IPC lanes)
-ucp_device.o: ucp_device.cu ucp_device_ops.hpp ucp_proto.hpp .build-config
-	$(NVCC) $(NVCCFLAGS) -I$(UCX_HOME)/include -I. -c -o $@ ucp_device.cu
+onesided_device.o: onesided_device.cu onesided_device_ops.hpp onesided_proto.hpp .build-config
+	$(NVCC) $(NVCCFLAGS) -DCOLLAGE_ST_UCP -I$(UCX_HOME)/include -I. -c -o $@ onesided_device.cu
+else ifeq ($(ST),nvshmem)
+# NVSHMEM >= 2.x. NVSHMEM 3.x ships libnvshmem_host.so + libnvshmem_device.a;
+# 2.x has a single libnvshmem.a: NVSHMEM_LIBS="-lnvshmem".
+# The device library is relocatable device code: the kernels are compiled with
+# -rdc and device-linked once (os_dlink.o), for the GPU architecture in use.
+NVSHMEM_HOME ?= /usr/local/nvshmem
+NVSHMEM_LIB  ?= $(NVSHMEM_HOME)/lib
+NVSHMEM_LIBS ?= -lnvshmem_host -lnvshmem_device
+NVSHMEM_ARCH ?= $(if $(CUDA_ARCH),$(CUDA_ARCH),-arch=sm_80)
+CXXFLAGS  += -DCOLLAGE_ST_NVSHMEM
+LDFLAGS   += -L$(NVSHMEM_LIB) -Wl,-rpath,$(NVSHMEM_LIB)
+OBJS      += onesided_device.o os_dlink.o
+LIBS      := $(NVSHMEM_LIBS) -lcudadevrt $(LIBS) -lcuda
+
+onesided_device.o: onesided_device.cu onesided_device_ops.hpp onesided_proto.hpp .build-config
+	$(NVCC) $(NVCCFLAGS) $(if $(CUDA_ARCH),,$(NVSHMEM_ARCH)) -rdc=true -DCOLLAGE_ST_NVSHMEM -I$(NVSHMEM_HOME)/include -I. \
+	    -c -o $@ onesided_device.cu
+os_dlink.o: onesided_device.o .build-config
+	$(NVCC) $(NVSHMEM_ARCH) -dlink -o $@ onesided_device.o -L$(NVSHMEM_LIB) -lnvshmem_device
 else
-$(error ST must be mpich, acx, cray or ucp)
+$(error ST must be mpich, acx, cray, ucp or nvshmem)
 endif
 endif
 
@@ -90,7 +112,7 @@ collage: bench.cpp $(HEADERS) $(OBJS) .build-config
 	$(MPICXX) $(CXXFLAGS) -o $@ bench.cpp $(OBJS) $(LDFLAGS) $(LIBS)
 
 clean:
-	rm -f collage gpu_reduce.o acx_dlink.o ucp_device.o .build-config
+	rm -f collage gpu_reduce.o acx_dlink.o onesided_device.o os_dlink.o .build-config
 
 FORCE:
 .PHONY: all clean FORCE

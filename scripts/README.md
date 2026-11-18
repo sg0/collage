@@ -95,8 +95,7 @@ Each study script only sets defaults.
 | `BUFFERS` | GPU scripts: `gpu`, `host` or `"gpu host"` (`algos` default: both) |
 | `GPU_REDUCE` | local reductions on GPU data: `kernel` `mpi` `host` (`kernel`) |
 | `GPU_MAP` | device of local rank i (`3,2,1,0`) |
-| `TRANSPORTS` | GPU scripts: transports of the algorithms' messages, e.g. `"mpi cray"` (`mpi`; `cray` needs `ST=cray
-scripts/build_perlmutter.sh gpu`; `ucp` is for InfiniBand/RoCE clusters, since UCX has no device lanes on Slingshot) |
+| `TRANSPORTS` | GPU scripts: transports of the algorithms' messages, e.g. `"mpi cray"` (`mpi`; `cray` needs `ST=cray perlmutter/build_perlmutter.sh gpu`; `shmem` needs `ST=nvshmem perlmutter/build_perlmutter.sh gpu` and NERSC's `nvshmem` module, and runs over libfabric with NVSHMEM's host proxy here; `ucp` is for InfiniBand/RoCE clusters, since UCX has no device lanes on Slingshot) |
 | `MAX_MEM` | per-rank buffer cap (CPU: half the node's memory / PPN; GPU: 16G) |
 | `STEP_MIN`, `SAFETY_MIN` | step time limit and margin, in minutes (20 or 30, and 2) |
 | `STUDY`, `OUTDIR` | output location (`$SCRATCH/collage_study/<study>/<cpu\|gpu>_<N>N`) |

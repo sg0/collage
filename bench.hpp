@@ -81,9 +81,9 @@ struct Options {
     std::string transport = "mpi";          /* --transport mpi | mpich | acx | cray */
     bool st_all_peers = false;              /* --st-peers all: also queue on-node messages */
     bool st_peers_set = false;              /* --st-peers given explicitly */
-    size_t ucp_heap = (size_t)4 << 30;      /* --ucp-heap */
-    int ucp_slots = 16;                     /* --ucp-slots */
-    double ucp_timeout = 60.0;              /* --ucp-timeout */
+    size_t os_heap = (size_t)4 << 30;       /* --ucp-heap / --shmem-heap */
+    int os_slots = 16;                      /* --ucp-slots / --shmem-slots */
+    double os_timeout = 60.0;               /* --ucp-timeout / --shmem-timeout */
     bool mpich_progress = false;            /* --mpich-progress-thread */
     bool thread_multiple = false;           /* --thread-multiple (implied by stream transports) */
 };
@@ -1287,11 +1287,20 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 if (o.transport == "mpi") {
                     std::printf("# transport    : mpi (%s, host-driven; MPI thread level %s)\n",
                                 o.gpu ? "CUDA-aware MPI" : "MPI", tls);
-                } else if (o.transport == "ucp") {
-#if defined(COLLAGE_ST_UCP)
-                    std::printf("# transport    : ucp (%s), device-initiated one-sided puts + counters;\n"
+                } else if (o.transport == "ucp" || o.transport == "shmem") {
+#if defined(COLLAGE_ONESIDED)
+                    std::printf("# transport    : %s (%s), device-initiated one-sided puts + %s;\n"
                                 "#                MPI only for bootstrap (thread level %s); arena %zu MiB/rank, %d slots/peer\n",
-                                ucpx::api_name(), tls, o.ucp_heap >> 20, o.ucp_slots);
+                                o.transport.c_str(), osx::api_name().c_str(),
+                                o.transport == "ucp" ? "counters" : "signals", tls, o.os_heap >> 20, o.os_slots);
+#if defined(COLLAGE_OS_NVSHMEM)
+                    {
+                        const char* rt = std::getenv("NVSHMEM_REMOTE_TRANSPORT");
+                        const char* gda = std::getenv("NVSHMEM_IB_ENABLE_IBGDA");
+                        std::printf("#                NVSHMEM_REMOTE_TRANSPORT=%s NVSHMEM_IB_ENABLE_IBGDA=%s\n",
+                                    rt ? rt : "(default)", gda ? gda : "(default: proxy)");
+                    }
+#endif
                     if (!o.st_all_peers)
                         std::printf("#                on-node messages use CUDA-aware MPI (--st-peers inter)\n");
 #endif
@@ -1515,11 +1524,11 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::printf("# messages on rank 0: %llu queued on the stream, %llu plain (on-node);"
                             " %llu host waits for the stream before a plain call\n",
                             xs.enqueued, xs.plain, xs.host_waits);
-#if defined(COLLAGE_ST_UCP)
-                if (xport::kind() == xport::Kind::Ucp) {
-                    const ucpx::Engine& ue = ucpx::eng();
-                    std::printf("# ucp on rank 0: %llu sends, %llu receives, %llu kernels launched;"
-                                " arena peak %zu MiB of %zu MiB\n",
+#if defined(COLLAGE_ONESIDED)
+                if (xport::onesided(xport::kind())) {
+                    const osx::Engine& ue = osx::eng();
+                    std::printf("# %s on rank 0: %llu sends, %llu receives, %llu kernels launched;"
+                                " arena peak %zu MiB of %zu MiB\n", o.transport.c_str(),
                                 ue.n_send, ue.n_recv, ue.n_kernels, ue.alloc.peak() >> 20, ue.arena_bytes >> 20);
                 }
 #endif
@@ -1547,11 +1556,12 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 const int csv_ppn = per_node.empty() ? size : *std::max_element(per_node.begin(), per_node.end());
                 const std::string csv_buffers = o.gpu ? "gpu" : "host";
                 const std::string csv_reduce = o.gpu && runner->reduction() ? o.gpu_reduce : "-";
-                /* the suffix marks the non-default peer scope (ucp: all by default) */
+                /* the suffix marks the non-default peer scope (ucp/shmem: all by default) */
+                const bool csv_os = o.transport == "ucp" || o.transport == "shmem";
                 const std::string csv_transport =
-                    o.transport + (o.transport == "mpi"   ? ""
-                                   : o.transport == "ucp" ? (o.st_all_peers ? "" : ":inter")
-                                                          : (o.st_all_peers ? ":all" : ""));
+                    o.transport + (o.transport == "mpi" ? ""
+                                   : csv_os             ? (o.st_all_peers ? "" : ":inter")
+                                                        : (o.st_all_peers ? ":all" : ""));
                 std::string csv_tag = o.tag;
                 std::replace(csv_tag.begin(), csv_tag.end(), ',', ';');
                 std::fprintf(f, "collective,algorithm,variant,type,op,ranks,nodes,ranks_per_node,buffers,gpu_reduce,"

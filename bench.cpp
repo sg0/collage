@@ -147,15 +147,19 @@ void usage()
         "                         cray: Cray MPICH stream-triggered MPIX_Queue (build ST=cray)\n"
         "                         ucp: UCX GPU device API, device-initiated one-sided puts\n"
         "                         and counters, no MPI after bootstrap (build ST=ucp)\n"
+        "                         shmem: NVSHMEM device API, the same protocol on\n"
+        "                         put-with-signal (IBGDA, NVLink, proxy; build ST=nvshmem)\n"
         "                         Stream-triggered transports queue sends, receives,\n"
         "                         waits, copies and reduction kernels on the CUDA stream;\n"
         "                         they need MPI_THREAD_MULTIPLE (requested automatically)\n"
         "      --st-peers P       inter: queue only messages to other nodes, on-node ones\n"
         "                         use CUDA-aware MPI | all: queue every message\n"
-        "                         (default inter; ucp: all)\n"
-        "      --ucp-heap BYTES   ucp: registered device arena per rank (default 4G)\n"
-        "      --ucp-slots R      ucp: receives in flight per peer (default 16)\n"
-        "      --ucp-timeout S    ucp: GPU-side timeout in seconds (default 60)\n"
+        "                         (default inter; ucp, shmem: all)\n"
+        "      --ucp-heap BYTES   ucp/shmem: device arena per rank (default 4G; alias --shmem-heap)\n"
+        "      --ucp-slots R      ucp/shmem: receives in flight per peer (default 16;\n"
+        "                         alias --shmem-slots)\n"
+        "      --ucp-timeout S    ucp/shmem: GPU-side timeout in seconds (default 60;\n"
+        "                         alias --shmem-timeout)\n"
         "      --mpich-progress-thread  start MPICH's stream progress thread\n"
         "                         (MPIX_Start_progress_thread; transport mpich)\n"
         "      --thread-multiple  initialise MPI with MPI_THREAD_MULTIPLE for the plain\n"
@@ -281,9 +285,9 @@ Options parse(int argc, char** argv, bool& list, bool& help)
             o.st_peers_set = true;
         }
         else if (a == "--mpich-progress-thread") o.mpich_progress = true;
-        else if (a == "--ucp-heap") o.ucp_heap = parse_bytes(v());
-        else if (a == "--ucp-slots") o.ucp_slots = std::stoi(v());
-        else if (a == "--ucp-timeout") o.ucp_timeout = std::stod(v());
+        else if (a == "--ucp-heap" || a == "--shmem-heap") o.os_heap = parse_bytes(v());
+        else if (a == "--ucp-slots" || a == "--shmem-slots") o.os_slots = std::stoi(v());
+        else if (a == "--ucp-timeout" || a == "--shmem-timeout") o.os_timeout = std::stod(v());
         else if (a == "--thread-multiple") o.thread_multiple = true;
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
@@ -500,7 +504,8 @@ int main(int argc, char** argv)
     /* stream-triggered transports call MPI from library threads (MPI-ACX proxy,
      * MPICH GPU host functions / progress thread): MPI_THREAD_MULTIPLE */
     const std::string want_transport = argv_value(argc, argv, "--transport");
-    const bool want_multiple = (!want_transport.empty() && want_transport != "mpi" && want_transport != "ucp") ||
+    const bool want_multiple = (!want_transport.empty() && want_transport != "mpi" && want_transport != "ucp" &&
+                                want_transport != "shmem") ||
                                argv_has(argc, argv, "--thread-multiple");
     if (want_multiple) {
         int provided = MPI_THREAD_SINGLE;
@@ -523,8 +528,8 @@ int main(int argc, char** argv)
 #endif
         }
         if (!help && !list) {
-            /* ucp needs no thread level beyond the default: MPI is only its bootstrap */
-            if (o.thread_multiple || (o.transport != "mpi" && o.transport != "ucp")) {
+            /* ucp/shmem need no thread level beyond the default: MPI is only their bootstrap */
+            if (o.thread_multiple || (o.transport != "mpi" && o.transport != "ucp" && o.transport != "shmem")) {
                 int provided = MPI_THREAD_SINGLE;
                 MPI_Query_thread(&provided);
                 if (provided < MPI_THREAD_MULTIPLE)
@@ -537,12 +542,12 @@ int main(int argc, char** argv)
                 xport::parse_kind(o.transport, k);
                 /* every rank must succeed, or all stop together */
                 std::string err;
-                /* ucp moves on-node messages over its CUDA-IPC lanes too, unless told otherwise */
-                if (k == xport::Kind::Ucp && !o.st_peers_set) o.st_all_peers = true;
-#if defined(COLLAGE_ST_UCP)
-                xport::st().ucp_heap = o.ucp_heap;
-                xport::st().ucp_slots = (uint32_t)o.ucp_slots;
-                xport::st().ucp_timeout = o.ucp_timeout;
+                /* ucp/shmem move on-node messages themselves too (CUDA IPC, NVLink), unless told otherwise */
+                if (xport::onesided(k) && !o.st_peers_set) o.st_all_peers = true;
+#if defined(COLLAGE_ONESIDED)
+                xport::st().os_heap = o.os_heap;
+                xport::st().os_slots = (uint32_t)o.os_slots;
+                xport::st().os_timeout = o.os_timeout;
 #endif
                 try { xport::configure(k, o.st_all_peers, o.mpich_progress); } catch (const std::exception& e) { err = e.what(); }
                 int bad = err.empty() ? 0 : 1, first_bad = bad ? rank : INT_MAX;
