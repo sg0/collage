@@ -75,7 +75,8 @@ struct Options {
     bool native = true;                     /* include the native MPI baseline */
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
-    std::string bw = "bus";                 /* bandwidth tables on stdout: bus | alg | both | none */
+    std::string bw = "bus,wire";            /* tables after the latencies: alg,bus,wire,traffic | all | none */
+    bool wire = true;                       /* count the wire bytes (one untimed call per cell) */
     std::string tag;                        /* free-form label copied into every CSV row */
     bool quiet = false;
     int split_mask = 0;                     /* >0: run on N/M concurrent groups of M ranks */
@@ -1146,6 +1147,9 @@ struct Cell {
     double avg = 0, min = 0, max = 0;  /* microseconds: mean / min / max over all ranks */
     double gmin = 0, gmax = 0;         /* microseconds: min / max over groups of the group mean */
     double aggbw = 0;                  /* MB/s: sum over groups of payload / group mean */
+    bool counted = false;              /* wire bytes known (algorithms; not native) */
+    double wire = 0, wire_inter = 0;   /* bytes on the busiest rank's port (inter-node: busiest such port) */
+    double aggwirebw = 0;              /* MB/s: sum over groups of group busiest port / group mean */
     std::string note;
 };
 
@@ -1637,6 +1641,14 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
     }
     /* which node every rank is on, for the layout report (rank 0 only) */
     const std::vector<int> node_of = node_map(world);
+    /* node_of is filled on rank 0 only; the wire accounting needs it everywhere */
+    std::vector<int> node_all = node_of;
+    {
+        int wsz = 0;
+        MPI_Comm_size(world, &wsz);
+        node_all.resize((size_t)wsz);
+        MPI_Bcast(node_all.data(), wsz, MPI_INT, 0, world);
+    }
     if (o.root < 0 || o.root >= gsize)
         throw std::invalid_argument("--root out of range (must be < " + std::to_string(gsize) +
                                     (o.split_mask > 0 ? ", the group size)" : ")"));
@@ -1853,11 +1865,15 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                             "#                averaged over the %d groups (all groups start together)\n", groups);
             else
                 std::printf("# times        : average latency in microseconds (mean over ranks)\n");
-            if (runner->sized() && !o.check_only && o.bw != "none")
+            if (runner->sized() && !o.check_only && o.bw != "none") {
                 std::printf("# bandwidth    : GB/s, after the latencies; algbw = S / time, busbw = algbw * %s\n"
                             "#                (n = %d ranks%s; nccl-tests' definitions), S = %s\n",
                             runner->bus_rule(), gsize, o.split_mask > 0 ? " per group" : "",
                             bw_size_text(o.coll).c_str());
+                if (o.wire)
+                    std::printf("#                wirebw = bytes on the busiest rank's port (max of sent, received;\n"
+                                "#                counted in one untimed call) / time; traffic = those bytes / S\n");
+            }
             std::fflush(stdout);
         }
 
@@ -1999,6 +2015,25 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     if (o.check_only) continue;
 
                     runner->stage(v.base);
+                    /* wire accounting: one untimed call with the byte counters on
+                     * (wire.hpp); the timed iterations below only see the flag off */
+                    double my_port = 0;
+                    if (o.wire && v.def) {
+                        wire::begin(world);
+                        struct WireOff {
+                            ~WireOff() { wire::end(); }
+                        } wire_off;
+                        call();
+                        wire::end();
+                        const wire::Traffic t = wire::collect(world, node_all);
+                        my_port = t.port();
+                        double v2[2] = {t.port(), t.port_inter()}, mx2[2] = {0, 0};
+                        MPI_Allreduce(v2, mx2, 2, MPI_DOUBLE, MPI_MAX, world);
+                        cell.counted = true;
+                        cell.wire = mx2[0];
+                        cell.wire_inter = mx2[1];
+                        runner->stage(v.base);
+                    }
                     for (int w = 0; w < warm; ++w) call();
                     double sum = 0;
                     for (int it = 0; it < iters; ++it) {
@@ -2049,6 +2084,13 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     cell.gmin = gmn;
                     cell.gmax = gmx;
                     cell.aggbw = aggbw;
+                    if (cell.counted) {
+                        double gport = 0, wcontrib = 0, aggw = 0;
+                        MPI_Allreduce(&my_port, &gport, 1, MPI_DOUBLE, MPI_MAX, comm);
+                        wcontrib = gmean > 0 ? gport / gmean / gsize : 0.0;
+                        MPI_Allreduce(&wcontrib, &aggw, 1, MPI_DOUBLE, MPI_SUM, world);
+                        cell.aggwirebw = aggw;
+                    }
                 } catch (const NotApplicable& e) {
                     cell.state = Cell::NA;
                     cell.note = e.what();
@@ -2117,9 +2159,52 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     std::printf("\n");
                 }
             };
-            const bool want_alg = o.bw == "alg" || o.bw == "both", want_bus = o.bw == "bus" || o.bw == "both";
+            auto want = [&](const char* k) {
+                if (o.bw == "all") return true;
+                const std::string l = "," + o.bw + ",";
+                return l.find(std::string(",") + k + ",") != std::string::npos;
+            };
+            const bool want_alg = want("alg"), want_bus = want("bus");
+            const bool want_wire = o.wire && want("wire"), want_traffic = o.wire && want("traffic");
+            /* per-cell tables from the wire counts (native: not counted) */
+            auto wtable = [&](const char* title, int what) {
+                std::printf("#\n# %s\n", title);
+                std::printf("%-12s", "# bytes");
+                for (auto& v : variants) std::printf(" %*s", (int)std::max<size_t>(12, v.label.size()), v.label.c_str());
+                std::printf("\n");
+                for (size_t ci = 0; ci < counts.size(); ++ci) {
+                    std::printf("%-12zu", counts[ci] * sizeof(T));
+                    const double pb = runner->payload_bytes(counts[ci]);
+                    for (size_t vi = 0; vi < variants.size(); ++vi) {
+                        const Cell& c = results[ci][vi];
+                        int w = (int)std::max<size_t>(12, variants[vi].label.size());
+                        char buf[64];
+                        double val = 0;
+                        if (what == 0) val = c.avg > 0 ? c.wire / c.avg / 1e3 : 0.0;   /* GB/s */
+                        else if (what == 1) val = c.aggwirebw / 1e3;
+                        else val = pb > 0 ? c.wire / pb : 0.0;                        /* traffic factor */
+                        switch (c.state) {
+                            case Cell::Ok: case Cell::Fail:
+                                if (!c.counted) std::snprintf(buf, sizeof buf, "-");
+                                else if (what == 2 && pb <= 0) std::snprintf(buf, sizeof buf, "-");
+                                else std::snprintf(buf, sizeof buf, what == 2 ? "%.3f" : "%.3f", val);
+                                break;
+                            case Cell::NA: std::snprintf(buf, sizeof buf, "n/a"); break;
+                            case Cell::Skip: std::snprintf(buf, sizeof buf, "skip"); break;
+                        }
+                        std::printf(" %*s", w, buf);
+                    }
+                    std::printf("\n");
+                }
+            };
             if (want_alg) table("algbw in GB/s (S / time)", false, 1.0);
             if (want_bus) table("busbw in GB/s (algbw * bus factor)", false, bf);
+            if (want_wire) wtable("wirebw in GB/s (busiest port's bytes / time)", 0);
+            if (want_traffic) {
+                char t[160];
+                std::snprintf(t, sizeof t, "traffic factor (busiest port's bytes / S; busbw's factor is %s)", runner->bus_rule());
+                wtable(t, 2);
+            }
             if (o.split_mask > 0) {
                 char t[160];
                 if (want_alg) {
@@ -2129,6 +2214,10 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 if (want_bus) {
                     std::snprintf(t, sizeof t, "aggregate busbw in GB/s: sum over the %d groups of the group's busbw", groups);
                     table(t, true, bf);
+                }
+                if (want_wire) {
+                    std::snprintf(t, sizeof t, "aggregate wirebw in GB/s: sum over the %d groups of the group's wirebw", groups);
+                    wtable(t, 1);
                 }
             }
             std::fflush(stdout);
@@ -2201,7 +2290,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::replace(csv_tag.begin(), csv_tag.end(), ',', ';');
                 std::fprintf(f, "collective,algorithm,variant,type,op,ranks,nodes,ranks_per_node,buffers,gpu_reduce,"
                                 "transport,groups,group_ranks,layout,root,bytes,count,"
-                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,busbw_MBps,aggbusbw_MBps,tag,note\n");
+                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,busbw_MBps,aggbusbw_MBps,wire_bytes,wire_inter_bytes,traffic,wirebw_MBps,aggwirebw_MBps,tag,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
                         const Cell& c = results[ci][vi];
@@ -2213,6 +2302,13 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                         if ((c.state == Cell::Ok || c.state == Cell::Fail) && c.avg > 0) bw = pb / c.avg;  /* B/us == MB/s */
                         std::string note = c.note;
                         std::replace(note.begin(), note.end(), ',', ';');
+                        /* wire columns: empty when not counted (native, --no-wire) */
+                        auto wf = [](bool ok, const char* f, double x) {
+                            if (!ok) return std::string();
+                            char b[64];
+                            std::snprintf(b, sizeof b, f, x);
+                            return std::string(b);
+                        };
                         /* RFC 4180: a variant label with several tunables, e.g.
                          * chain[seg=8K,fo=4], contains commas and is quoted */
                         auto field = [](const std::string& v) {
@@ -2222,12 +2318,16 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                             return q + "\"";
                         };
                         const std::string csv_variant = field(variants[vi].label), csv_layout = field(layout);
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%s,%s\n",
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%s,%s,%s,%s,%s,%s,%s\n",
                                      o.coll.c_str(), variants[vi].base.c_str(), csv_variant.c_str(),
                                      type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, csv_nodes,
                                      csv_ppn, csv_buffers.c_str(), csv_reduce.c_str(), csv_transport.c_str(), groups, gsize, csv_layout.c_str(),
                                      o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw, c.aggbw,
                                      bw * runner->bus_factor(), c.aggbw * runner->bus_factor(),
+                                     wf(c.counted, "%.0f", c.wire).c_str(), wf(c.counted, "%.0f", c.wire_inter).c_str(),
+                                     wf(c.counted && pb > 0, "%.4f", pb > 0 ? c.wire / pb : 0.0).c_str(),
+                                     wf(c.counted && c.avg > 0, "%.2f", c.avg > 0 ? c.wire / c.avg : 0.0).c_str(),
+                                     wf(c.counted, "%.2f", c.aggwirebw).c_str(),
                                      csv_tag.c_str(), note.c_str());
                     }
                 std::fclose(f);

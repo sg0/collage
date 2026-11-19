@@ -11,6 +11,7 @@ default the range is 0 B to 4 MiB in powers of two. It can optionally check
 each result against an exact reference.
 
 The algorithm set is the one in the original headers. No algorithms were added.
+
 I would like to acknowledge the implicit generosity and dedication of the MPI 
 implementers, researchers, and, broadly the MPI Forum for continuing to steer 
 HPC ahead.
@@ -21,6 +22,7 @@ HPC ahead.
 |---|---|
 | `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware send/receive wrappers over the transport layer, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
 | `verify.hpp` | deep verification: per-step reduction checks, per-message checksums and their exchange, fault injection (`--check-steps`, `--check-msgs`, `--inject`) |
+| `wire.hpp` | wire accounting: bytes each rank sends per call, counted in one untimed call (wirebw, traffic factor) |
 | `trace.hpp`, `replay.hpp` | communication traces: recording (`--trace`), the trace format, and the host-driven replayer (`--replay`) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
 | `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs, or device-initiated one-sided UCX or NVSHMEM (`--transport`) |
@@ -114,7 +116,8 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--trace-times` | with `--trace`: also record each operation's start and end (ns), for the simulator converters | off |
 | `--replay DIR` | run the recorded traces instead of the algorithms, as variants `replay:ALGO`, on this run's transport and memory space | off |
 | `--inject SPEC` | deliberately corrupt `reduce:RANK:K[:ELEM]` (the K-th local reduction on RANK) or `msg:SRC:DST:K[:BYTE]` (the K-th message from SRC received on DST), to test the checks | off |
-| `--bw MODE` | bandwidth tables (GB/s) after the latency table: `bus` (bus bandwidth), `alg`, `both` or `none` | `bus` |
+| `--bw LIST` | tables after the latency table, comma list of `alg`, `bus` (busbw), `wire` (wirebw), `traffic`; or `all`, `none` | `bus,wire` |
+| `--no-wire` | do not count wire bytes (skips the one untimed counted call per cell) | off |
 | `--csv FILE` | `avg/min/max` µs, algorithm and bus bandwidth per (variant, size) | – |
 | `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
 | `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
@@ -192,13 +195,65 @@ algorithm or the reduction operation. So within a table, busbw ranks the
 algorithms exactly as latency does, and an algorithm moving more data than
 the optimum (e.g. linear, or `allgather_reduce`) shows a lower busbw.
 
-`--bw alg` prints algbw instead, `--bw both` prints both tables, and
-`--bw none` prints neither. The header states S and the factor for the run.
+#### Wire bandwidth and traffic factor (per algorithm)
+
+Busbw says what an optimal algorithm would need; it does not say what an
+algorithm actually put on the network. For that, collage counts the bytes
+each rank sends to every other rank in one extra, untimed call per
+(algorithm, size), before the warmup. What a rank receives is what the
+others sent it, so no receive counting is needed. Messages to self are not
+counted.
+
+* **port bytes:** for each rank, the larger of the bytes it sent and the
+  bytes it received. The count is per direction because links are
+  full-duplex.
+* **wire bytes:** the port bytes of the busiest rank.
+* `wirebw = wire bytes / time`: how hard this algorithm drove the busiest
+  port. Compare it with the link's peak in one direction.
+* `traffic = wire bytes / S`: how much data the algorithm moves, relative to
+  S. It depends only on the algorithm, its tunables, n and the root, not on
+  timing. For allreduce at n = 8 it is 1.75 for `ring` and
+  `redscat_allgather` (the optimum, equal to busbw's factor), 3 for
+  `recursivedoubling` (log₂n) and 7 for `linear` (the root's port).
+
+Read them next to busbw, not instead of it. An algorithm that moves
+redundant data can show a high wirebw while finishing later; its traffic
+factor shows why. As a guide:
+
+| busbw | wirebw | meaning |
+|---|---|---|
+| near the link peak | near the link peak | bandwidth-optimal and saturating |
+| low | near the link peak | the network is busy with extra traffic |
+| low | low | bound by latency or synchronisation |
+
+Sequential phases add up on the port. `nonoverlapping` allreduce (binomial
+reduce, then binomial bcast) has traffic 3 = log₂8 per direction, while its
+time has 2·log₂n·S of serialised transfers (COST_MODEL.md's β column
+counts time on the critical path, not volume).
+
+The counted call is the only place counting happens. In the timed iterations
+the send wrappers test one flag that is off, so the timings are unaffected.
+Native MPI is not counted (its traffic is invisible to collage) and shows `-`.
+`--no-wire` skips the counted call.
+
+#### Choosing the tables
+
+`--bw` takes a comma list of `alg`, `bus`, `wire` and `traffic`, or `all` or
+`none`. The default is `bus,wire`. The header states S, busbw's factor and,
+with counting on, the wirebw definition.
 
 With `--csv FILE`, one row per (algorithm variant, size) is written. It
-includes `algbw_MBps` and `busbw_MBps` and, summed over the groups,
-`aggbw_MBps` and `aggbusbw_MBps`. Without `--split-mask` the summed columns
-equal the per-group ones. A variant
+includes:
+
+* `algbw_MBps` and `busbw_MBps`;
+* summed over the groups, `aggbw_MBps` and `aggbusbw_MBps`. Without
+  `--split-mask` they equal the per-group values;
+* `wire_bytes` and `wire_inter_bytes`. The second is the busiest port
+  counting only messages to and from other nodes;
+* `traffic`, `wirebw_MBps` and `aggwirebw_MBps`. The wire columns are empty
+  for native MPI and with `--no-wire`.
+
+A variant
 label that names several swept tunables, such as `chain[seg=8K,fo=4]`,
 contains commas and is quoted (RFC 4180), so CSV readers such as pandas read it
 as one field.
@@ -284,11 +339,11 @@ Inside a group, ranks are ordered by world rank, and `--root` is the rank
 * **Latency table:** a group's latency is the mean over its ranks. Each cell
   is the mean of that over the groups.
 * **Aggregate bandwidth tables** (after the per-group bandwidth tables,
-  following `--bw`): the sum over groups of the group's busbw (or algbw, `S /
-  group latency`), in GB/s.
+  following `--bw`): the sum over groups of the group's busbw, wirebw or
+  algbw (`S / group latency`), in GB/s.
 * **CSV:** adds `groups`, `group_ranks`, `layout` (`consecutive`, `stride=K`
   or `random:p=P:seed=S`), `group_min_us` / `group_max_us` (the fastest and
-  slowest group), `aggbw_MBps` and `aggbusbw_MBps`.
+  slowest group) and the `agg*` bandwidth columns.
 * `--check` verifies every group's result; deep-check findings and the error
   map are labelled `group G:`.
 
@@ -380,7 +435,7 @@ algorithms themselves are unchanged. All the transport-specific code is in
 | `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
 | `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
 | `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
-| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx)  | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
 
 * **Only messages to other nodes are queued** (`--st-peers inter`, the
   default). Messages to peers on the same node keep CUDA-aware MPI, which
@@ -800,7 +855,10 @@ were verified. Wildcard receives (barrier `linear`) are not matched.
 
 The comparison is exact for data movement and for the low-precision types.
 Floating-point reductions allow 1e-5 (float) or 1e-12 (double) relative
-error, although the generated inputs keep them exact in practice. 
+error, although the generated inputs keep them exact in practice. The full
+matrix was run with MPICH 4.2.3 and passed. It covered 1–8 ranks, all
+collectives and algorithms, all operations, several types, roots, segment
+sizes, radices, request limits and count distributions.
 
 ## Traces and replay
 
@@ -929,7 +987,7 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Job scripts 
+## Job launch scripts
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and

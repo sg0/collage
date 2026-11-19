@@ -155,7 +155,7 @@ Requirements: `python3` with pandas, matplotlib and seaborn. On Perlmutter,
 
 ```bash
 python3 plots/plot_collage.py $SCRATCH/collage_study -o figs            # every figure
-python3 plots/plot_collage.py $SCRATCH/collage_study/algos -o figs/algos --kind latency,busbw,best,scaling,ppn
+python3 plots/plot_collage.py $SCRATCH/collage_study/algos -o figs/algos --kind latency,busbw,wirebw,best,scaling,ppn
 python3 plots/plot_collage.py $SCRATCH/collage_study --study split -o figs/split --kind layout,random
 python3 plots/plot_collage.py $SCRATCH/collage_study --study tunables -o figs/tunables --kind tunables
 python3 plots/plot_collage.py $SCRATCH/collage_study --study algos --kind buffers --nodes 128 -o figs/gpu
@@ -165,6 +165,7 @@ python3 plots/plot_collage.py $SCRATCH/collage_study --study algos --kind buffer
 |---|---|
 | `latency` | latency vs size, one panel per node count, one line per algorithm (native: black dashed) |
 | `busbw` | bus bandwidth (nccl-tests' busbw, GB/s) vs size, same panels as `latency` |
+| `wirebw` | wire bandwidth (busiest port's bytes / time, GB/s) vs size, algorithms only |
 | `best` | heatmap nodes × size: the fastest algorithm in each cell, coloured by its speedup over native (+ `best_algorithms.csv`) |
 | `scaling` | latency vs node count at a few sizes (`--sizes 1K,64K,4M`) |
 | `ppn` | latency vs processes per node, per node count (CPU) |

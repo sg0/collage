@@ -12,6 +12,8 @@ raw/ folders written by the Perlmutter job scripts, or any `collage --csv` file.
 Figure kinds (--kind, comma separated, default all):
   latency   latency vs message size; one panel per node count; one line per algorithm
   busbw     bus bandwidth (nccl-tests' busbw, GB/s) vs message size, same layout
+  wirebw    wire bandwidth (bytes on the busiest rank's port / time, GB/s) vs size;
+            algorithms only (CSV files with the wire columns)
   best      heatmap nodes x size: speedup of the best algorithm over native MPI,
             with the winner's name in each cell (+ best_algorithms.csv, the table view)
   scaling   latency vs node count at a few message sizes (also covers barrier)
@@ -196,10 +198,13 @@ def load(paths):
                                  "reduce_scatter", "reduce_scatter_block"])
     factor[nm1] = (n - 1) / n
     factor[df["collective"] == "barrier"] = 0.0
-    if "busbw_MBps" not in df.columns:
-        df["busbw_MBps"] = df["algbw_MBps"] * factor
-    if "aggbusbw_MBps" not in df.columns:
-        df["aggbusbw_MBps"] = df["aggbw_MBps"] * factor
+    # per row: files with and without the columns can be mixed
+    for col, src in (("busbw_MBps", "algbw_MBps"), ("aggbusbw_MBps", "aggbw_MBps")):
+        derived = df[src] * factor
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(derived) if col in df.columns else derived
+    for c in ("wirebw_MBps", "traffic"):
+        if c not in df.columns:
+            df[c] = np.nan
     if (df["ranks_per_node"] == 0).any():
         df.loc[df["ranks_per_node"] == 0, "ranks_per_node"] = df["ranks"] // df["nodes"].clip(lower=1)
 
@@ -223,13 +228,14 @@ def load(paths):
     df["study"] = df["tag"].astype(str).str.extract(r"study=([^;]+)", expand=False).fillna("-")
 
     df = df[df["status"].isin(["ok"])].copy()
-    for c in ("avg_us", "aggbw_MBps", "busbw_MBps", "aggbusbw_MBps", "bytes", "nodes", "ranks_per_node", "ranks"):
+    for c in ("avg_us", "aggbw_MBps", "busbw_MBps", "aggbusbw_MBps", "wirebw_MBps", "traffic", "bytes", "nodes", "ranks_per_node", "ranks"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     # repeated measurements of the same case (re-runs): keep the median
     keys = ["collective", "algorithm", "variant", "nodes", "bytes"] + CONFIG_COLS
     df = df.groupby(keys, as_index=False, dropna=False).agg(
         avg_us=("avg_us", "median"), aggbw_MBps=("aggbw_MBps", "median"), busbw_MBps=("busbw_MBps", "median"),
-        aggbusbw_MBps=("aggbusbw_MBps", "median"), ranks=("ranks", "first"))
+        aggbusbw_MBps=("aggbusbw_MBps", "median"), wirebw_MBps=("wirebw_MBps", "median"),
+        traffic=("traffic", "median"), ranks=("ranks", "first"))
     return df
 
 
@@ -349,6 +355,11 @@ def fig_latency(df, a):
 
 def fig_busbw(df, a):
     return fig_vs_size(df, a, "busbw_MBps", 1e-3, "bus bandwidth (GB/s)", "bus bandwidth", "busbw", positive=True)
+
+
+def fig_wirebw(df, a):
+    d = df[df["wirebw_MBps"].notna()]
+    return fig_vs_size(d, a, "wirebw_MBps", 1e-3, "wire bandwidth (GB/s)", "wire bandwidth", "wirebw", positive=True)
 
 
 def fig_vs_size(df, a, ycol, scale, ylabel, what, subdir, positive=False):
@@ -816,7 +827,7 @@ def main():
     ap.add_argument("--max-panels", type=int, default=12, help="algorithm panels in layout/tunables figures")
     a = ap.parse_args()
     a.formats = a.formats.split(",")
-    kinds = (["latency", "busbw", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers", "transport"]
+    kinds = (["latency", "busbw", "wirebw", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers", "transport"]
              if a.kind == "all" else a.kind.split(","))
 
     theme()
@@ -833,6 +844,8 @@ def main():
             made = fig_latency(df, a)
         elif k == "busbw":
             made = fig_busbw(df, a)
+        elif k == "wirebw":
+            made = fig_wirebw(df, a)
         elif k == "best":
             made = fig_best(df, a)
         elif k == "scaling":

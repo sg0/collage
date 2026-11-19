@@ -32,6 +32,7 @@
 
 #include "memory.hpp"
 #include "verify.hpp"
+#include "wire.hpp"
 #include "trace.hpp"
 #include "collage_op_plugin.h"
 #include <type_traits>
@@ -679,6 +680,18 @@ public:
         MPI_CHECK(MPI_Comm_size(comm_, &size_));
         MPI_CHECK(MPI_Comm_rank(comm_, &rank_));
         cid_ = vfy::st().next_cid++; /* same order on every rank: identifies the communicator */
+        /* rank in comm_ -> rank in MPI_COMM_WORLD, for the wire accounting */
+        {
+            MPI_Group g, w;
+            MPI_Comm_group(comm_, &g);
+            MPI_Comm_group(MPI_COMM_WORLD, &w);
+            std::vector<int> mine((size_t)size_);
+            for (int i = 0; i < size_; ++i) mine[(size_t)i] = i;
+            world_of_.resize((size_t)size_);
+            MPI_Group_translate_ranks(g, size_, mine.data(), w, world_of_.data());
+            MPI_Group_free(&g);
+            MPI_Group_free(&w);
+        }
         ch_.open(comm_); /* collective: node locality, stream communicator */
     }
     virtual ~CollBase()
@@ -701,6 +714,7 @@ protected:
     MPI_Comm comm_ = MPI_COMM_NULL;
     int rank_ = 0, size_ = 1;
     int cid_ = 0;
+    std::vector<int> world_of_;  /* comm_ rank -> world rank */
     xport::Channel ch_;
 
     /* --check-msgs hooks (verify.hpp): sends are checksummed when posted,
@@ -708,6 +722,11 @@ protected:
     void note_send(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag) const
     {
         if (vfy::msgs_on()) vfy::on_send(cid_, buf, count, dt, dest, tag);
+        if (wire::st().on && dest >= 0 && dest != rank_ && dest < size_) {  /* off in timed iterations */
+            MPI_Count ts = 0;
+            MPI_Type_size_x(dt, &ts);
+            wire::add(world_of_[(size_t)dest], (double)count * (double)ts);
+        }
     }
     int note_recv(void* buf, size_t count, MPI_Datatype dt, int src, int tag) const
     {
@@ -743,10 +762,25 @@ protected:
         trc::rec_p2p(kind, cid_, buf, count, dt, peer, tag, &id);
         return (int)id;
     }
-    static void trace_wait1(int id)
+    static size_t trace_wait1(int id, double t0 = -1)
     {
-        if (id >= 0 && trc::on()) trc::rec_wait({(uint32_t)id});
+        return (id >= 0 && trc::on()) ? trc::rec_wait({(uint32_t)id}, t0) : (size_t)-1;
     }
+    static void trace_end(size_t rec)
+    {
+        if (rec != (size_t)-1 && trc::on()) trc::finish(rec);
+    }
+    /* a blocking send/recv: the p2p record, then its wait, spanning the call */
+    struct TraceBlocking {
+        int id;
+        double t0;
+        ~TraceBlocking() { trace_wait1(id, t0); }
+    };
+    struct TracePosted {
+        bool on;
+        ~TracePosted() { if (on && trc::on()) trc::p2p_posted(); }
+    };
+    static double trace_t0() { return trc::on() && trc::st().times ? (double)trc::now_ns() : -1; }
     static const Request* active_of(const Request* r) { return r->k == Request::Pers ? &r->p->active : r; }
 
 #if COLLAGE_LARGE_COUNT
@@ -771,7 +805,8 @@ protected:
     void send(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag) const
     {
         note_send(buf, count, dt, dest, tag);
-        struct W { int id; ~W() { trace_wait1(id); } } tw{trace_op('S', buf, count, dt, dest, tag)};
+        const double tb0 = trace_t0();
+        TraceBlocking tw{trace_op('S', buf, count, dt, dest, tag), tb0};
         if (ch_.enq(dest)) {
             Request r;
             xport::enq_isend(ch_, buf, count, dt, dest, tag, &r);
@@ -790,7 +825,8 @@ protected:
     void ssend(const void* buf, size_t count, MPI_Datatype dt, int dest, int tag) const
     {
         note_send(buf, count, dt, dest, tag);
-        struct W { int id; ~W() { trace_wait1(id); } } tw{trace_op('Z', buf, count, dt, dest, tag)};
+        const double tb0 = trace_t0();
+        TraceBlocking tw{trace_op('Z', buf, count, dt, dest, tag), tb0};
         if (ch_.enq(dest)) {
             Request r;
             xport::enq_isend(ch_, buf, count, dt, dest, tag, &r);
@@ -808,7 +844,8 @@ protected:
               MPI_Status* st = MPI_STATUS_IGNORE) const
     {
         const int ck = note_recv(buf, count, dt, src, tag);
-        struct W { int id; ~W() { trace_wait1(id); } } tw{trace_op('R', buf, count, dt, src, tag)};
+        const double tb0 = trace_t0();
+        TraceBlocking tw{trace_op('R', buf, count, dt, src, tag), tb0};
         if (ch_.enq(src)) {
             Request r;
             xport::enq_irecv(ch_, buf, count, dt, src, tag, &r);
@@ -832,6 +869,7 @@ protected:
     {
         note_send(buf, count, dt, dest, tag);
         const int tid = trace_op('S', buf, count, dt, dest, tag);
+        TracePosted tp_{tid >= 0};
         if (ch_.enq(dest)) {
             xport::enq_isend(ch_, buf, count, dt, dest, tag, req);
             req->tr = tid;
@@ -853,6 +891,7 @@ protected:
     {
         note_send(buf, count, dt, dest, tag);
         const int tid = trace_op('Z', buf, count, dt, dest, tag);
+        TracePosted tp_{tid >= 0};
         if (ch_.enq(dest)) {
             xport::enq_isend(ch_, buf, count, dt, dest, tag, req);
             req->tr = tid;
@@ -873,6 +912,7 @@ protected:
     {
         const int ck = note_recv(buf, count, dt, src, tag);
         const int tid = trace_op('R', buf, count, dt, src, tag);
+        TracePosted tp_{tid >= 0};
         if (ch_.enq(src)) {
             xport::enq_irecv(ch_, buf, count, dt, src, tag, req);
             req->ck = ck;
@@ -896,7 +936,7 @@ protected:
                    Request* req) const
     {
         *req = Request{};
-        if (xport::streamed() || vfy::msgs_on() || trc::on()) { /* checks, traces: see every start */
+        if (xport::streamed() || vfy::msgs_on() || trc::on() || wire::st().on) { /* checks, traces, wire count: see every start */
             req->k = Request::Pers;
             req->p = new xport::Persist{true, buf, count, dt, dest, tag, Request{}};
             return;
@@ -912,7 +952,7 @@ protected:
                    Request* req) const
     {
         *req = Request{};
-        if (xport::streamed() || vfy::msgs_on() || trc::on()) {
+        if (xport::streamed() || vfy::msgs_on() || trc::on() || wire::st().on) {
             req->k = Request::Pers;
             req->p = new xport::Persist{false, buf, count, dt, src, tag, Request{}};
             return;
@@ -958,19 +998,21 @@ protected:
                 return;
             case Request::Host: {
                 const int ck = req->ck;
-                trace_wait1(req->tr);
+                const size_t trec = trace_wait1(req->tr);
                 xport::forget_status(st);
                 MPI_Status mine;
                 MPI_Status* sp = status_for(ck, st, &mine);
                 MPI_CHECK(MPI_Wait(&req->h, sp));
                 if (req->h == MPI_REQUEST_NULL) *req = Request{}; /* persistent ones stay */
+                trace_end(trec);
                 recv_done(ck, sp, recv_type(ck));
                 return;
             }
             case Request::Enq: {
                 const int ck = req->ck;
-                trace_wait1(req->tr);
+                const size_t trec = trace_wait1(req->tr);
                 xport::enq_wait(req, st);
+                trace_end(trec);
                 recv_done(ck);
                 return;
             }
@@ -1002,7 +1044,8 @@ protected:
                 any_hck = any_hck || r->ck >= 0;
             }
         }
-        if (trc::on()) trc::rec_wait(trs);
+        const size_t trec = trc::on() ? trc::rec_wait(trs) : (size_t)-1;
+        struct End { size_t r; ~End() { trace_end(r); } } trace_end_{trec};
         /* the stream waits first (does not block the host), then the host waits */
         xport::enq_waitall((int)enq.size(), enq.data());
         for (int x : cks) recv_done(x); /* stream path: no status, bounded by the buffer */
@@ -1031,9 +1074,10 @@ protected:
                     h[(size_t)i] = reqs[i].h;
                     if (reqs[i].tr >= 0) trs.push_back((uint32_t)reqs[i].tr);
                 }
-            if (trc::on()) trc::rec_waitany(trs); /* replays as a waitany over the same set */
+            const size_t trec = trc::on() ? trc::rec_waitany(trs) : (size_t)-1; /* replays as a waitany */
             MPI_Status sw;
             MPI_CHECK(MPI_Waitany(n, h.data(), idx, &sw));
+            if (trec != (size_t)-1) trc::waitany_done(trec, *idx != MPI_UNDEFINED ? reqs[*idx].tr : -1);
             if (*idx != MPI_UNDEFINED) {
                 const int ck = reqs[*idx].ck;
                 reqs[*idx].h = h[(size_t)*idx];

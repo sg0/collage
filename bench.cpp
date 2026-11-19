@@ -151,8 +151,11 @@ void usage()
         "                         (ranks within the group; K counts from 1)\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
         "      --tag TEXT         label copied into every CSV row (e.g. job id, study)\n"
-        "      --bw MODE          bandwidth tables after the latencies (GB/s): bus (bus\n"
-        "                         bandwidth, nccl-tests' busbw; default) | alg | both | none\n"
+        "      --bw LIST          tables after the latencies, comma list (default bus,wire):\n"
+        "                         alg (S/time), bus (nccl-tests' busbw), wire (bytes on the\n"
+        "                         busiest rank's port / time), traffic (those bytes / S);\n"
+        "                         or all, none\n"
+        "      --no-wire          do not count wire bytes (skips one untimed call per cell)\n"
         "  -q, --quiet            no table on stdout\n"
         "\n"
         "GPU buffers (needs a CUDA-aware MPI and a build with `make CUDA=1`)\n"
@@ -331,9 +334,17 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--bw") {
             o.bw = v();
-            if (o.bw != "bus" && o.bw != "alg" && o.bw != "both" && o.bw != "none")
-                throw std::invalid_argument("--bw: bus, alg, both or none");
+            if (o.bw == "both") o.bw = "alg,bus";
+            if (o.bw != "all" && o.bw != "none") {
+                std::string l = o.bw + ",";
+                for (size_t p = 0, q; (q = l.find(',', p)) != std::string::npos; p = q + 1) {
+                    const std::string k = l.substr(p, q - p);
+                    if (k != "alg" && k != "bus" && k != "wire" && k != "traffic")
+                        throw std::invalid_argument("--bw: a comma list of alg, bus, wire, traffic; or all, none");
+                }
+            }
         }
+        else if (a == "--no-wire") o.wire = false;
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
         else throw std::invalid_argument("unknown option '" + a + "' (see --help)");
