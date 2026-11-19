@@ -24,12 +24,12 @@ studies, and each one has a CPU-node script and a GPU-node script.
 
 ```bash
 cd $HOME/proj/collage          # or set COLLAGE_HOME to wherever the sources are
-perlmutter/build_perlmutter.sh # both binaries; or: cpu | gpu
+scripts/build_perlmutter.sh # both binaries; or: cpu | gpu
 ```
 
 To also compile in Cray MPICH's stream-triggered transport (`--transport
 cray`, see the main README), build the GPU binary with
-`ST=cray perlmutter/build_perlmutter.sh gpu`. The plain transport stays
+`ST=cray scripts/build_perlmutter.sh gpu`. The plain transport stays
 available in that binary, so `TRANSPORTS="mpi cray"` compares both in one job.
 Whether the installed Cray MPICH supports these queues with CUDA streams is
 not confirmed: HPE documents them with HIP streams. Run a short `--check` job
@@ -43,11 +43,11 @@ reduction kernels are built for `sm_80`.
 ## 2. Submit
 
 ```bash
-perlmutter/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
-perlmutter/submit_study.sh split gpu
-perlmutter/submit_study.sh all both        # every study on both node types: 24 jobs
-NODE_COUNTS="16 128" TIME=08:00:00 perlmutter/submit_study.sh tunables cpu
-sbatch -N 64 perlmutter/collage_split_cpu.sbatch   # a single job
+scripts/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
+scripts/submit_study.sh split gpu
+scripts/submit_study.sh all both        # every study on both node types: 24 jobs
+NODE_COUNTS="16 128" TIME=08:00:00 scripts/submit_study.sh tunables cpu
+sbatch -N 64 scripts/collage_split_cpu.sbatch   # a single job
 ```
 
 All scripts use account `m4626` and `-q regular`. Override these with
@@ -56,13 +56,13 @@ at most 8 nodes and 30 minutes, so it suits a smoke test:
 
 ```bash
 NODE_COUNTS=2 QOS=debug TIME=00:20:00 COLLS=allreduce PPN_LIST=128 \
-    perlmutter/submit_study.sh algos cpu
+    scripts/submit_study.sh algos cpu
 ```
 
 To print the plan without running anything (on a login node):
 
 ```bash
-DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash perlmutter/collage_split_cpu.sbatch
+DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash scripts/collage_split_cpu.sbatch
 ```
 
 ### Resubmit until done
@@ -95,7 +95,8 @@ Each study script only sets defaults.
 | `BUFFERS` | GPU scripts: `gpu`, `host` or `"gpu host"` (`algos` default: both) |
 | `GPU_REDUCE` | local reductions on GPU data: `kernel` `mpi` `host` (`kernel`) |
 | `GPU_MAP` | device of local rank i (`3,2,1,0`) |
-| `TRANSPORTS` | GPU scripts: transports of the algorithms' messages, e.g. `"mpi cray"` (`mpi`; `cray` needs `ST=cray perlmutter/build_perlmutter.sh gpu`; `shmem` needs `ST=nvshmem perlmutter/build_perlmutter.sh gpu` and NERSC's `nvshmem` module, and runs over libfabric with NVSHMEM's host proxy here; `ucp` is for InfiniBand/RoCE clusters, since UCX has no device lanes on Slingshot) |
+| `TRANSPORTS` | GPU scripts: transports of the algorithms' messages, e.g. `"mpi cray"` (`mpi`; `cray` needs `ST=cray
+scripts/build_perlmutter.sh gpu`; `shmem` needs `ST=nvshmem scripts/build_perlmutter.sh gpu` and NERSC's `nvshmem` module, and runs over libfabric with NVSHMEM's host proxy here; `ucp` is for InfiniBand/RoCE clusters, since UCX has no device lanes on Slingshot) |
 | `MAX_MEM` | per-rank buffer cap (CPU: half the node's memory / PPN; GPU: 16G) |
 | `STEP_MIN`, `SAFETY_MIN` | step time limit and margin, in minutes (20 or 30, and 2) |
 | `STUDY`, `OUTDIR` | output location (`$SCRATCH/collage_study/<study>/<cpu\|gpu>_<N>N`) |
