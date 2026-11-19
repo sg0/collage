@@ -33,8 +33,7 @@ HPC ahead.
 | `collage_op_plugin.h`, `examples/op_plugin_absmax.cu` | plugin ABI for custom reduction operators with a CUDA kernel (`-o plugin:PATH`), and a complete example |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
 | `bench.cpp` | command-line driver, runtime datatype dispatch |
-| `tools/collage2goal.py`, `tools/collage2dumpi.py`, `tools/collage_trace.py` | trace converters for network simulators
-(experimental): GOAL (LogGOPSim, ATLAHS) and SST DUMPI (SST/macro), and the trace reader they share |
+| `tools/collage2goal.py`, `tools/collage2dumpi.py`, `tools/collage_trace.py` | trace converters for network simulators: GOAL (LogGOPSim, ATLAHS) and SST DUMPI (SST/macro), and the trace reader they share |
 | `scripts/` | Slurm job scripts for parameter studies on NERSC Perlmutter (see [scripts/README.md](scripts/README.md)) |
 | `plots/plot_collage.py` | seaborn figures from the CSV output of those studies (or any `--csv` file) |
 
@@ -346,7 +345,7 @@ algorithms themselves are unchanged. All the transport-specific code is in
 | `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
 | `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
 | `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
-| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) over any MPI | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
 
 * **Only messages to other nodes are queued** (`--st-peers inter`, the
   default). Messages to peers on the same node keep CUDA-aware MPI, which
