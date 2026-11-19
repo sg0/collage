@@ -105,6 +105,8 @@ struct State {
         void* ctx;
     };
     std::vector<DeviceOp> device_ops;
+    /* verification hook (verify.hpp): replaces reduce() while it is set */
+    void (*reduce_check)(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op) = nullptr;
 };
 
 inline State& st()
@@ -197,6 +199,19 @@ inline void* device_alloc(size_t bytes)
     s.live[p] = cap;
     return p;
 }
+/* bytes from p to the end of the device block that holds it (SIZE_MAX:
+ * not a pooled device block, e.g. host memory) */
+inline size_t remaining(const void* p)
+{
+    State& s = st();
+    if (s.live.empty()) return SIZE_MAX;
+    auto it = s.live.upper_bound(const_cast<void*>(p));
+    if (it == s.live.begin()) return SIZE_MAX;
+    --it;
+    const char* b = static_cast<const char*>(it->first);
+    const char* c = static_cast<const char*>(p);
+    return c >= b && c < b + it->second ? (size_t)(b + it->second - c) : SIZE_MAX;
+}
 inline void device_free(void* p)
 {
     if (!p) return;
@@ -209,6 +224,9 @@ inline void device_free(void* p)
     s.pool[it->second].push_back(p);
     s.live.erase(it);
 }
+#endif
+#if !defined(COLLAGE_CUDA)
+inline size_t remaining(const void*) { return SIZE_MAX; }
 #endif
 
 /* release cached device memory and the stream (call before MPI_Finalize) */
@@ -463,8 +481,8 @@ inline void reduce_staged(const void* in, void* inout, size_t count, MPI_Datatyp
 }
 #endif
 
-/* inout = in (op) inout, in the current memory space */
-inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op)
+/* inout = in (op) inout, in the current memory space (without the check hook) */
+inline void reduce_impl(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op)
 {
     if (0 == count) return;
 #if defined(COLLAGE_CUDA)
@@ -508,6 +526,17 @@ inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, M
     }
 #endif
     reduce_local_mpi(in, inout, count, dt, op);
+}
+
+/* inout = in (op) inout, in the current memory space */
+inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op)
+{
+    if (0 == count) return;
+    if (st().reduce_check) {
+        st().reduce_check(in, inout, count, dt, op); /* calls reduce_impl itself */
+        return;
+    }
+    reduce_impl(in, inout, count, dt, op);
 }
 
 inline const char* reduce_mode_name(ReduceMode m)

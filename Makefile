@@ -1,4 +1,4 @@
-# collage: point-to-point collective algorithm benchmark
+# collage: collective algorithm benchmark
 #
 #   make                       host-only build
 #   make CUDA=1                with GPU buffers (--gpu); needs a CUDA-aware MPI

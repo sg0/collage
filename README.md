@@ -1,12 +1,14 @@
-# COLLAGE — COLLective AlGorithm bEnchmark
+# collage — collective algorithm benchmark
 
-`COLLAGE` benchmarks the collective algorithms from Open MPI's `coll/base`
+`collage` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
-is re-implemented with plain MPI point-to-point calls. You pick one collective,
-and `collage` times every algorithm for it (plus the MPI library's own
-collective as a baseline) over a range of message sizes. By default the range
-is 0 B to 4 MiB in powers of two. It can optionally check each result against
-the native MPI collective.
+is re-implemented as a sequence of sends, receives and local reductions, and a
+transport layer carries the messages: MPI by default (CUDA-aware with `--gpu`),
+or a stream-triggered or device-initiated one-sided transport (`--transport`).
+You pick one collective, and `collage` times every algorithm for it (plus the
+MPI library's own collective as a baseline) over a range of message sizes. By
+default the range is 0 B to 4 MiB in powers of two. It can optionally check
+each result against an exact reference.
 
 The algorithm set is the one in the original headers. No algorithms were added.
 
@@ -18,7 +20,8 @@ HPC ahead.
 
 | file | contents |
 |---|---|
-| `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware p2p wrappers, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
+| `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware send/receive wrappers over the transport layer, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
+| `verify.hpp` | deep verification: per-step reduction checks, per-message checksums and their exchange, fault injection (`--check-steps`, `--check-msgs`, `--inject`) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
 | `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs, or device-initiated one-sided UCX or NVSHMEM (`--transport`) |
 | `onesided_transport.hpp`, `onesided_proto.hpp`, `onesided_device_ops.hpp`, `onesided_device.cu` | `--transport ucp` and `--transport shmem`: the device-initiated one-sided engine (host setup per back end: UCX or NVSHMEM), shared layouts, the GPU protocol (one copy, a few primitives per back end), and its kernels |
@@ -101,7 +104,12 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `-i / -w` | timed / warm-up iterations | `100 / 10` |
 | `--iters-large / --warmup-large / --large` | same, for messages above `--large` | `20 / 5 / 64K` |
 | `--max-mem B` | skip cases whose buffers exceed `B` per rank | `2G` |
-| `--check`, `--check-only` | verify against native MPI (and time / don't time) | off |
+| `--check`, `--check-only` | verify every algorithm's result (and time / don't time); on failure, print a rank × block error map | off |
+| `--check-ref R` | `analytic` (computed from every rank's generated inputs, independent of MPI) or `native` (what the native collective produces) | `analytic` |
+| `--check-steps` | also verify every local reduction step against a host reference: names the rank and step that computed wrong | off |
+| `--check-msgs` | also checksum every message at both ends and compare per pair after the call: names the link that corrupted data | off |
+| `--check-iters N` | also verify every Nth timed iteration (restaged and compared outside the timed region) | off |
+| `--inject SPEC` | deliberately corrupt `reduce:RANK:K[:ELEM]` (the K-th local reduction on RANK) or `msg:SRC:DST:K[:BYTE]` (the K-th message from SRC received on DST), to test the checks | off |
 | `--csv FILE` | `avg/min/max` µs and algorithmic bandwidth per (variant, size) | – |
 | `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
 | `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
@@ -118,9 +126,9 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 Tunable options take comma-separated lists. An algorithm that uses a tunable
 gets one column per value, labelled for example `knomial[seg=8K,k=2]`.
 
-### Message sizes
+### What "size" means
 
-| collective | message size |
+| collective | message size is … |
 |---|---|
 | bcast | bytes broadcast |
 | reduce, allreduce | bytes reduced on each rank |
@@ -155,9 +163,9 @@ contains commas and is quoted (RFC 4180), so CSV readers such as pandas read it
 as one field.
 
 The harness uses MPI collectives only for synchronisation (a barrier before
-each timed iteration), statistics, and the `--check` reference. The algorithms
-themselves only use point-to-point calls, derived datatypes and
-`MPI_Reduce_local`.
+each timed iteration), statistics, and the `--check` bookkeeping. The
+algorithms themselves only send and receive (through the transport layer),
+use derived datatypes, and reduce locally.
 
 ### Concurrent groups (`--split-mask`)
 
@@ -240,8 +248,8 @@ Inside a group, ranks are ordered by world rank, and `--root` is the rank
 * **CSV:** adds `groups`, `group_ranks`, `layout` (`consecutive`, `stride=K`
   or `random:p=P:seed=S`), `group_min_us` / `group_max_us` (the fastest and
   slowest group) and `aggbw_MBps`.
-* `--check` verifies every group against the native collective on that
-  group's communicator.
+* `--check` verifies every group's result; deep-check findings and the error
+  map are labelled `group G:`.
 
 How groups map onto nodes depends on how the launcher places ranks. For
 example, with 8 ranks per node packed by core, `--split-mask 8` puts each
@@ -331,7 +339,7 @@ algorithms themselves are unchanged. All the transport-specific code is in
 | `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
 | `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
 | `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
-| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) over any MPI | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
 
 * **Only messages to other nodes are queued** (`--st-peers inter`, the
   default). Messages to peers on the same node keep CUDA-aware MPI, which
@@ -581,8 +589,9 @@ the footer counts kernel, MPI and host-staged reductions. A launcher that
 returns nonzero, `--gpu-reduce mpi|host`, and the native baseline all use the
 host function.
 
-`--check` compares the algorithms against MPI's own collective with the same
-op, using the small-integer `sum` inputs. Your host and device functions must
+`--check` compares the algorithms against the analytic reference, which folds
+every rank's small-integer `sum` inputs with your host function (or, with
+`--check-ref native`, against MPI's own collective with the same op). Your host and device functions must
 therefore agree, and the op must be associative. If it is not exact (for
 example, floating-point arithmetic other than min/max), the comparison is
 exact only when the order of the reduction does not change the result.
@@ -646,7 +655,7 @@ neighbor exchange becomes `ring` on odd sizes, and `scatter_allgather` becomes
 `linear` when `count < size`.
 
 **Composite algorithms.** Upstream, these call "whatever collective is
-selected on the communicator". Here they are wired to fixed point-to-point
+selected on the communicator". Here they are wired to fixed collage
 sub-algorithms, so nothing reaches the MPI library's collectives:
 
 | algorithm | sub-steps used here |
@@ -660,54 +669,97 @@ sub-algorithms, so nothing reaches the MPI library's collectives:
 
 To use different sub-steps, change the corresponding line in the header.
 
-## Changes relative to the draft and to upstream
-
-The draft headers were partly copied Open MPI source (`MCA_PML_CALL`,
-`ompi_datatype_*`, `goto err_hndl`) and partly unfinished ports. `utils.hpp`
-was only present as a vim swap file. Everything was rewritten against the
-upstream sources at the commit above, keeping control flow and message
-schedules identical. These are the changes:
-
-* **Buffers are typed, counts are elements.** Every algorithm takes `T*`
-  buffers and `size_t` counts/displacements. The draft computed offsets as
-  `(T*)buf + i * count * sizeof(T)`, which scales by `sizeof(T)` twice. It also
-  had separate send/recv types `U`/`T`; one element type is used now.
-* **Packing and datatype copies became `memcpy`.** `opal_convertor_pack` (the
-  in-place alltoall(v)), `ompi_datatype_sndrcv` and
-  `ompi_datatype_copy_content_same_ddt` are equivalent to `memcpy` for
-  contiguous predefined types. Indexed datatypes are still built with
-  `MPI_Type_indexed(_c)` where upstream uses them (alltoall bruck, allgatherv
-  bruck / neighborexchange / basic_default, reduce_scatter_block
-  recursivedoubling).
-* **Persistent requests are freed.** Linear alltoall(v) now calls
-  `MPI_Request_free` on its persistent requests after `MPI_Waitall`. The draft
-  leaked them.
-* **Sparbit tags are non-negative.** Sparbit uses `TAG_BASE + block` instead of
-  upstream's negative internal tag space. At very large scale,
-  `1000 + size` must not exceed `MPI_TAG_UB`. MPI guarantees at least 32767,
-  and real implementations allow far more.
-* **Signed arithmetic in bcast scatter_allgather(_ring).** At this commit,
-  upstream uses `size_t` for `recv_count`/`send_count` and then tests
-  `<= 0` / `< 0`. That can underflow when blocks run past the end of the
-  buffer. The port uses signed 64-bit counts, which is what the code intends.
-* **Zero-size messages run the algorithm.** MPI libraries return early for
-  most collectives at count 0. Here, the 0-byte row runs each algorithm with
-  empty messages, which measures its latency term. Segmented algorithms use one
-  empty segment, and leaf processes in segmented reduce always send at least
-  one message, so the tree never deadlocks. The exceptions are algorithms
-  where upstream itself returns early for zero counts (`reduce_scatter_block`
-  and reduce_scatter `recursivehalving`).
-* **`TypeMap<long>` fixed.** The draft mapped `long` to `MPI_LONG_INT`, which
-  is a pair type. The type map now uses fixed-width `MPI_INT*_T`/`MPI_UINT*_T`.
-* **Errors abort, unsupported cases throw.** Errors go through `MPI_CHECK`,
-  which reports file and line and aborts. Algorithms that can't run in a given
-  configuration throw `NotApplicable`, and the harness reports `n/a`.
-
 ## Verification
 
-`--check` runs the native MPI collective once per size to build the
-reference. It then re-initialises the inputs, runs each algorithm once on
-poisoned output buffers, and compares the result element by element. 
+```bash
+mpirun -np 64 ./collage -c allreduce --check                              # result + error map
+mpirun -np 64 ./collage -c allreduce --check --check-steps --check-msgs   # + every step and message
+mpirun -np 8  ./collage -c allreduce -a ring --check-only --check-steps --check-msgs \
+              --inject reduce:3:2                                         # prove it finds a faulty PE
+```
+
+In the verification pass, each algorithm runs once per size, before timing,
+on freshly generated inputs and poisoned outputs. There are three layers. The
+first is always on with `--check`; the other two are opt-in, because they
+make the pass slower.
+
+**1. Result and error map (`--check`).** Every rank compares its whole result
+with a reference.
+
+* **The reference.** By default it is analytic. The inputs are a
+  deterministic function of (rank, element), so every rank computes its exact
+  expected result itself, without communicating. Reductions fold every rank's
+  inputs in MPI's canonical order with the same op (`MPI_Reduce_local`). The
+  reference therefore does not depend on the native collective being right,
+  and the native collective is checked like any other variant.
+  `--check-ref native` uses the native result instead.
+* **The error map.** On a failure, rank 0 gathers which result blocks are
+  wrong on which rank and prints a map. The columns are the P blocks of the
+  result, or for allgather(v), gather and alltoall(v), the rank each block
+  came from. The pattern says where to look:
+  * A block wrong on every rank that holds it went wrong before it was
+    distributed: in its reduction (the reduce-scatter half of ring or
+    Rabenseifner allreduce), or at the first rank that sent it.
+  * Blocks wrong on one rank only point at that rank's receive path or its
+    last local copy.
+  * Each failing rank also reports its first wrong element, with the value
+    it got and the value expected.
+
+  The map alone often can't tell computation from transit. A block reduced
+  wrong and a block corrupted on its first hop look the same once the
+  allgather has spread them. Layers 2 and 3 separate the two.
+
+**2. Every reduction step (`--check-steps`).** Every algorithm reduces
+through one function (`mem::reduce`). In the verification pass, each call is
+checked:
+* it snapshots both operands to the host;
+* it computes the reference with the op's host function;
+* it runs the real reduction (CUDA kernel, plugin kernel or `MPI_Reduce_local`);
+* it compares the result element by element, bit for bit.
+
+A mismatch is reported at once, with the rank, the step and the operands:
+
+```
+#   rank 3: compute: local reduction #2 (171 elements into rbuf[171]): 1 wrong,
+#           first rbuf[176]: 0 (op) 5 gave 16843103, expected 5
+```
+
+**3. Every message (`--check-msgs`).**
+* **Sender:** every message an algorithm sends is checksummed when it is posted.
+  The checksum is position-sensitive and 64-bit, taken over the packed bytes,
+  so derived datatypes work too.
+* **Receiver:** the received data is checksummed when the receive completes.
+* **After the call:** the ranks exchange their records with one
+  `MPI_Alltoallv` and match them per (communicator, source, destination,
+  tag, sequence number), the order in which MPI matches messages.
+
+This reports corrupted messages, messages that were sent but never received
+(or the reverse), and truncation:
+
+```
+#   rank 4: transit: rank 3 -> rank 4 (tag 105, message #0 of that tag, 4096 bytes):
+#           corrupted (checksum sent 580763811049259571, received 2165571346653481463)
+```
+
+Layers 2 and 3 need to read device data at the exact point of each step. In
+the verification pass the host therefore waits for the stream at each
+checked step. The stream-triggered and one-sided transports then behave like
+host-blocking MPI, which every algorithm is correct under; the timed
+iterations are unaffected. The footer reports how many steps and messages
+were verified. Wildcard receives (barrier `linear`) are not matched.
+
+**Other options.**
+* `--check-iters N` repeats layer 1 on every Nth timed iteration, for faults
+  that only appear under load. The inputs are restaged and the result is
+  compared outside the timed region.
+* `--inject` corrupts one reduction result or one received message on
+  purpose: one byte is flipped, after the step, or before the receiver's
+  checksum. Use it to confirm on your system that a fault is caught and
+  attributed to the right rank and link.
+
+The comparison is exact for data movement and for the low-precision types.
+Floating-point reductions allow 1e-5 (float) or 1e-12 (double) relative
+error, although the generated inputs keep them exact in practice. 
 
 ## Cost model
 
@@ -717,7 +769,7 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Job scripts for evaluations
+## Studies on Perlmutter
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and

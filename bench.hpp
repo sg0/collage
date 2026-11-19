@@ -64,6 +64,10 @@ struct Options {
     std::string vdist = "uniform";          /* uniform | random | linear */
     unsigned seed = 42;
     bool check = false, check_only = false;
+    bool check_steps = false, check_msgs = false; /* --check-steps, --check-msgs (verify.hpp) */
+    std::string check_ref = "analytic";     /* --check-ref analytic|native */
+    std::string inject;                     /* --inject SPEC */
+    int check_iters = 0;                    /* --check-iters N: also verify every Nth timed iteration */
     bool native = true;                     /* include the native MPI baseline */
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
@@ -168,8 +172,10 @@ inline T gen_value(Fill f, int r, size_t i)
 }
 
 template <typename T>
-inline bool values_equal(T a, T b)
+inline bool values_equal(T a, T b, bool exact = false)
 {
+    if constexpr (std::is_floating_point<T>::value)
+        if (exact) return (std::isnan(a) && std::isnan(b)) || a == b; /* copies: bit for bit */
     if constexpr (lowp::is_lowp<T>::value) {
         const float x = (float)a, y = (float)b; /* exact: the inputs keep every result representable */
         return (x != x && y != y) || x == y;
@@ -181,6 +187,25 @@ inline bool values_equal(T a, T b)
     } else {
         return a == b;
     }
+}
+
+/* one element as text (error reports) */
+template <typename T>
+inline std::string fmt_value(T v)
+{
+    char b[64];
+    if constexpr (std::is_same<T, double>::value) std::snprintf(b, sizeof b, "%.17g", v);
+    else if constexpr (lowp::is_float_like<T>::value) std::snprintf(b, sizeof b, "%.9g", (double)(float)v);
+    else if constexpr (std::is_signed<T>::value) std::snprintf(b, sizeof b, "%lld", (long long)v);
+    else std::snprintf(b, sizeof b, "%llu", (unsigned long long)v);
+    return b;
+}
+template <typename T>
+inline std::string fmt_raw(const void* p)
+{
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return fmt_value(v);
 }
 
 /* large-count aware native calls --------------------------------------------- */
@@ -254,6 +279,19 @@ public:
     virtual void native() = 0;
     /* the part of the output that is defined on this rank */
     virtual std::pair<const T*, size_t> result() const = 0;
+    /* the exact result of this rank, computed from the generated inputs of
+     * every rank without any communication (false: none, use native MPI) */
+    virtual bool reference(std::vector<T>& /*out*/) const { return false; }
+    /* how the result splits into blocks for the error map: start offsets
+     * (nblocks + 1 entries) and what a block is */
+    virtual std::vector<size_t> block_starts() const
+    {
+        const size_t L = result().second, nb = std::min<size_t>((size_t)size_, std::max<size_t>(L, 1));
+        std::vector<size_t> b(nb + 1);
+        for (size_t j = 0; j <= nb; ++j) b[j] = j * L / nb;
+        return b;
+    }
+    virtual bool blocks_by_source() const { return false; } /* block j = data from rank j */
 
     /* Buffers live on the host (sbuf_/rbuf_), where they are generated and
      * checked. With --gpu they are mirrored on the device (dsbuf_/drbuf_):
@@ -285,16 +323,61 @@ public:
         auto r = result();
         expected_.assign(r.first, r.first + r.second);
     }
+    /* the reference: analytic if the collective has one (and it was asked
+     * for), else what native MPI produced (call native() + snapshot() first) */
+    bool set_analytic_reference()
+    {
+        std::vector<T> e;
+        if (!reference(e)) return false;
+        expected_.swap(e);
+        return true;
+    }
+    /* where the result is wrong on this rank (for the error map) */
+    struct Detail {
+        size_t bad = 0, first = 0, len = 0;
+        std::string got, want;
+        std::string blocks; /* one char per block: '.' right, 'X' wrong */
+    };
     /* returns the number of mismatching elements on this rank */
-    size_t compare()
+    size_t compare(Detail* d = nullptr)
     {
         download();
         auto r = result();
-        if (r.second != expected_.size()) return std::max(r.second, expected_.size());
-        size_t bad = 0;
+        if (r.second != expected_.size()) {
+            if (d) { d->bad = std::max(r.second, expected_.size()); d->len = r.second; }
+            return std::max(r.second, expected_.size());
+        }
+        std::vector<size_t> bs;
+        if (d) {
+            bs = block_starts();
+            d->len = r.second;
+            d->blocks.assign(bs.size() > 1 ? bs.size() - 1 : 0, '.');
+        }
+        size_t bad = 0, blk = 0;
+        const bool exact = !reduction(); /* data movement must be exact; reductions allow rounding */
         for (size_t i = 0; i < r.second; ++i)
-            if (!values_equal(r.first[i], expected_[i])) ++bad;
+            if (!values_equal(r.first[i], expected_[i], exact)) {
+                if (d) {
+                    if (!bad) {
+                        d->first = i;
+                        d->got = fmt_value(r.first[i]);
+                        d->want = fmt_value(expected_[i]);
+                    }
+                    while (blk + 1 < bs.size() - 1 && i >= bs[blk + 1]) ++blk;
+                    if (blk < d->blocks.size()) d->blocks[blk] = 'X';
+                }
+                ++bad;
+            }
+        if (d) d->bad = bad;
         return bad;
+    }
+    /* name the user buffers for the step checks' messages */
+    void register_regions()
+    {
+        auto& rg = vfy::st().regions;
+        rg.clear();
+        rg.push_back({(const char*)R(), rbuf_.size() * sizeof(T), "rbuf"});
+        rg.push_back({(const char*)S(), sbuf_.size() * sizeof(T), "sbuf"});
     }
 
 protected:
@@ -312,6 +395,20 @@ protected:
     T* R() { return mem::device() ? drbuf_.data() : rbuf_.data(); }
 
     Fill fill() const { return reduction() ? fill_for(op_) : Fill::Data; }
+    /* reference helpers: element i of rank r's generated input */
+    T input(int r, size_t i) const { return gen_value<T>(fill(), r, i); }
+    /* the reduction over all ranks, in MPI's canonical order
+     * x0 op (x1 op (... op x_{p-1})), of inputs [off, off + m) */
+    std::vector<T> fold(size_t off, size_t m) const
+    {
+        std::vector<T> acc(m), tmp(m);
+        for (size_t i = 0; i < m; ++i) acc[i] = input(size_ - 1, off + i);
+        for (int r = size_ - 2; r >= 0; --r) {
+            for (size_t i = 0; i < m; ++i) tmp[i] = input(r, off + i);
+            mem::reduce_local_mpi(tmp.data(), acc.data(), m, dt_, op_.op); /* acc = x_r op acc */
+        }
+        return acc;
+    }
     void fill_input(std::vector<T>& v, size_t n, size_t offset = 0)
     {
         v.resize(std::max<size_t>(n, 1));
@@ -363,6 +460,12 @@ public:
         MPI_CHECK(NATIVE(MPI_Bcast)(this->R(), ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e.resize(this->count_);
+        for (size_t i = 0; i < this->count_; ++i) e[i] = this->input(this->opt_.root, i);
+        return true;
+    }
     std::vector<AlgoDef> algorithms() override
     {
         auto buf = [this]() { return this->R(); };
@@ -406,6 +509,12 @@ public:
         if (this->rank_ != this->opt_.root) return {this->rbuf_.data(), 0};
         return {this->rbuf_.data(), this->count_};
     }
+    bool reference(std::vector<T>& e) const override
+    {
+        if (this->rank_ == this->opt_.root) e = this->fold(0, this->count_);
+        else e.clear();
+        return true;
+    }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -447,6 +556,11 @@ public:
                                         this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e = this->fold(0, this->count_);
+        return true;
+    }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -487,6 +601,21 @@ public:
                                         ncnt(this->count_), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_ * this->size_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        const size_t n = this->count_;
+        e.resize(n * this->size_);
+        for (int j = 0; j < this->size_; ++j)
+            for (size_t i = 0; i < n; ++i) e[(size_t)j * n + i] = this->input(j, i);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override
+    {
+        std::vector<size_t> b((size_t)this->size_ + 1);
+        for (size_t j = 0; j < b.size(); ++j) b[j] = j * this->count_;
+        return b;
+    }
+    bool blocks_by_source() const override { return true; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -539,6 +668,20 @@ public:
                                          rd.data(), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), total_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e.resize(total_);
+        for (int j = 0; j < this->size_; ++j)
+            for (size_t i = 0; i < rcounts_[(size_t)j]; ++i) e[rdispls_[(size_t)j] + i] = this->input(j, i);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override
+    {
+        std::vector<size_t> b(rdispls_.begin(), rdispls_.end());
+        b.push_back(total_);
+        return b;
+    }
+    bool blocks_by_source() const override { return true; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -584,6 +727,22 @@ public:
                                        ncnt(this->count_), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_ * this->size_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        const size_t n = this->count_;
+        e.resize(n * this->size_);
+        for (int j = 0; j < this->size_; ++j)
+            for (size_t i = 0; i < n; ++i)
+                e[(size_t)j * n + i] = gen_value<T>(Fill::Data, j, (size_t)this->rank_ * 65537 + i);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override
+    {
+        std::vector<size_t> b((size_t)this->size_ + 1);
+        for (size_t j = 0; j < b.size(); ++j) b[j] = j * this->count_;
+        return b;
+    }
+    bool blocks_by_source() const override { return true; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -648,6 +807,21 @@ public:
                                         rc.data(), rd.data(), this->dt_, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), rtotal_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e.resize(rtotal_);
+        for (int j = 0; j < this->size_; ++j)
+            for (size_t i = 0; i < rcounts_[(size_t)j]; ++i)
+                e[rdispls_[(size_t)j] + i] = gen_value<T>(Fill::Data, j, (size_t)this->rank_ * 65537 + i);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override
+    {
+        std::vector<size_t> b(rdispls_.begin(), rdispls_.end());
+        b.push_back(rtotal_);
+        return b;
+    }
+    bool blocks_by_source() const override { return true; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -689,6 +863,24 @@ public:
         if (this->rank_ != this->opt_.root) return {this->rbuf_.data(), 0};
         return {this->rbuf_.data(), this->count_ * this->size_};
     }
+    bool reference(std::vector<T>& e) const override
+    {
+        e.clear();
+        if (this->rank_ != this->opt_.root) return true;
+        const size_t n = this->count_;
+        e.resize(n * this->size_);
+        for (int j = 0; j < this->size_; ++j)
+            for (size_t i = 0; i < n; ++i) e[(size_t)j * n + i] = this->input(j, i);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override
+    {
+        if (this->rank_ != this->opt_.root) return {0};
+        std::vector<size_t> b((size_t)this->size_ + 1);
+        for (size_t j = 0; j < b.size(); ++j) b[j] = j * this->count_;
+        return b;
+    }
+    bool blocks_by_source() const override { return true; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -724,6 +916,13 @@ public:
                                       ncnt(this->count_), this->dt_, this->opt_.root, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e.resize(this->count_);
+        for (size_t i = 0; i < this->count_; ++i)
+            e[i] = this->input(this->opt_.root, (size_t)this->rank_ * this->count_ + i);
+        return true;
+    }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -792,6 +991,14 @@ public:
                                              this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), rcounts_[this->rank_]}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        size_t off = 0;
+        for (int k = 0; k < this->rank_; ++k) off += rcounts_[(size_t)k];
+        e = this->fold(off, rcounts_[(size_t)this->rank_]);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override { return {0, rcounts_[(size_t)this->rank_]}; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -827,6 +1034,12 @@ public:
                                                    this->dt_, this->op_.op, this->comm_));
     }
     std::pair<const T*, size_t> result() const override { return {this->rbuf_.data(), this->count_}; }
+    bool reference(std::vector<T>& e) const override
+    {
+        e = this->fold((size_t)this->rank_ * this->count_, this->count_);
+        return true;
+    }
+    std::vector<size_t> block_starts() const override { return {0, this->count_}; }
     std::vector<AlgoDef> algorithms() override
     {
         auto s = [this]() { return (const T*)this->S(); };
@@ -1209,6 +1422,125 @@ inline void print_layout(const Options& o, int size, int groups, int gsize, cons
     if (groups > show) std::printf("#   ... (%d more groups)\n", groups - show);
 }
 
+/* ------------------------------------------------------------------------- */
+/* error map: where the final result is wrong, across ranks and blocks        */
+/* ------------------------------------------------------------------------- */
+/* Each rank knows which of its result blocks are wrong; rank 0 of `world`
+ * gathers them (per group) and points at the likely culprit:
+ *   a block wrong on every rank that holds it   -> it went wrong before it
+ *     was distributed: in its reduction, or at its source
+ *   blocks wrong on one rank only               -> that rank's receive path,
+ *     or its last local copy
+ * Returns the report lines on rank 0. */
+inline std::vector<std::string> error_map(MPI_Comm world, int group, int grank, int gsize, size_t bad, size_t first,
+                                          const std::string& got, const std::string& want, const std::string& blocks,
+                                          bool by_source)
+{
+    int me = 0, P = 1;
+    MPI_Comm_rank(world, &me);
+    MPI_Comm_size(world, &P);
+    const std::string line = std::to_string(group) + " " + std::to_string(grank) + " " + std::to_string(bad) + " " +
+                             std::to_string(first) + " " + (got.empty() ? "-" : got) + " " +
+                             (want.empty() ? "-" : want) + " " + (blocks.empty() ? "-" : blocks) + "\n";
+    int len = (int)line.size();
+    std::vector<int> lens((size_t)P), disp((size_t)P);
+    MPI_Gather(&len, 1, MPI_INT, lens.data(), 1, MPI_INT, 0, world);
+    std::string all;
+    if (me == 0) {
+        int t = 0;
+        for (int i = 0; i < P; ++i) { disp[(size_t)i] = t; t += lens[(size_t)i]; }
+        all.resize((size_t)t);
+    }
+    MPI_Gatherv(line.data(), len, MPI_CHAR, me == 0 ? &all[0] : nullptr, lens.data(), disp.data(), MPI_CHAR, 0, world);
+    std::vector<std::string> out;
+    if (me != 0) return out;
+
+    struct R { int g, r; size_t bad, first; std::string got, want, blocks; };
+    std::map<int, std::vector<R>> by_group;
+    {
+        size_t a = 0;
+        while (a < all.size()) {
+            size_t b = all.find('\n', a);
+            char got_s[96], want_s[96], blk[8192];
+            R x{};
+            if (std::sscanf(all.substr(a, b - a).c_str(), "%d %d %zu %zu %95s %95s %8191s", &x.g, &x.r, &x.bad,
+                            &x.first, got_s, want_s, blk) == 7) {
+                x.got = got_s; x.want = want_s; x.blocks = blk[0] == '-' ? "" : blk;
+                by_group[x.g].push_back(x);
+            }
+            a = b + 1;
+        }
+    }
+    auto ranges = [](const std::vector<int>& v) {
+        std::string s;
+        for (size_t i = 0; i < v.size();) {
+            size_t j = i;
+            while (j + 1 < v.size() && v[j + 1] == v[j] + 1) ++j;
+            if (!s.empty()) s += ",";
+            s += std::to_string(v[i]) + (j > i ? "-" + std::to_string(v[j]) : "");
+            i = j + 1;
+        }
+        return s;
+    };
+    const bool multi = by_group.size() > 1;
+    for (auto& kv : by_group) {
+        auto& rs = kv.second;
+        std::sort(rs.begin(), rs.end(), [](const R& a, const R& b) { return a.r < b.r; });
+        size_t tot = 0, nbad = 0, nb = 0;
+        for (const R& x : rs) { tot += x.bad; nbad += x.bad ? 1 : 0; nb = std::max(nb, x.blocks.size()); }
+        if (!tot) continue;
+        const std::string pre = multi ? "group " + std::to_string(kv.first) + ": " : "";
+        out.push_back(pre + std::to_string(tot) + " wrong elements on " + std::to_string(nbad) + " of " +
+                      std::to_string(gsize) + " ranks");
+        /* blocks wrong on every rank that holds them */
+        std::vector<int> global;
+        for (size_t b = 0; b < nb; ++b) {
+            int holders = 0, badc = 0;
+            for (const R& x : rs)
+                if (x.blocks.size() > b && !(by_source && x.r == (int)b)) { /* the source keeps its own copy */
+                    ++holders;
+                    badc += x.blocks[b] == 'X';
+                }
+            if (holders >= 2 && badc == holders) global.push_back((int)b);
+        }
+        const std::string what = by_source ? "data from rank" : "block";
+        if (!global.empty())
+            out.push_back(pre + what + (global.size() > 1 ? "s " : " ") + ranges(global) +
+                          (by_source ? ": wrong on every rank that received it -> corrupted on its way out of the source "
+                                       "(that rank's send path) or by the first rank that forwarded it"
+                                     : ": wrong on every rank -> went wrong before it was distributed (in the "
+                                       "reduction of that block, or on the first rank that sent it)"));
+        /* the rest: wrong only on some ranks */
+        int shown = 0;
+        for (const R& x : rs) {
+            if (!x.bad) continue;
+            std::vector<int> own;
+            for (size_t b = 0; b < x.blocks.size(); ++b)
+                if (x.blocks[b] == 'X' && !std::binary_search(global.begin(), global.end(), (int)b)) own.push_back((int)b);
+            std::string l = pre + "rank " + std::to_string(x.r) + ": " + std::to_string(x.bad) + " wrong, first at [" +
+                            std::to_string(x.first) + "] = " + x.got + ", expected " + x.want;
+            if (!own.empty())
+                l += "; " + what + (own.size() > 1 ? "s " : " ") + ranges(own) +
+                     " wrong only on some ranks -> this rank's receive or local-copy path, or a step upstream of "
+                     "it (--check-steps / --check-msgs tell which)";
+            if (shown++ < 12) out.push_back(l);
+        }
+        if (shown > 12) out.push_back(pre + "... " + std::to_string(shown - 12) + " more ranks");
+        /* the map itself, when it is small enough to read */
+        if (gsize <= 64 && nb >= 2 && nb <= 64) {
+            out.push_back(pre + "map (rows: ranks with errors; columns: " + (by_source ? "source rank" : "block") +
+                          ", X = wrong):");
+            for (const R& x : rs)
+                if (x.bad) {
+                    char h[32];
+                    std::snprintf(h, sizeof h, "  rank %4d  ", x.r);
+                    out.push_back(pre + h + x.blocks);
+                }
+        }
+    }
+    return out;
+}
+
 template <typename T>
 int run(MPI_Comm world, const Options& o, const std::string& type_name)
 {
@@ -1218,7 +1550,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
 
     /* --split-mask M[:K|:p]: N/M groups of M ranks, each running its own
      * instance of the collective concurrently. Without it: one group = world. */
-    int gsize = size, groups = 1;
+    int gsize = size, groups = 1, group_id = 0;
     MPI_Comm comm = world;
     std::vector<int> slots;  /* group layout, see group_layout() */
     if (o.split_mask > 0) {
@@ -1244,6 +1576,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             if (slots[s] == rank) color = s / gsize;
         /* key = world rank: inside a group, ranks keep their order on the line */
         MPI_CHECK(MPI_Comm_split(world, color, rank, &comm));
+        group_id = color;
     } else {
         /* a single group: every rank, in order */
         slots.resize(size);
@@ -1257,6 +1590,17 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
 
     OpInfo op = make_op<T>(o.op, type_name);
     int exit_code = 0;
+    /* deep verification (verify.hpp): rank numbers are group ranks */
+    {
+        vfy::State& vs = vfy::st();
+        vs.steps = o.check_steps;
+        vs.msgs = o.check_msgs;
+        vs.inject = o.inject.empty() ? vfy::Inject{} : vfy::parse_inject(o.inject);
+        MPI_Comm_rank(comm, &vs.rank);
+        vs.esize = sizeof(T);
+        vs.fmt = &fmt_raw<T>;
+        vs.prefix = groups > 1 ? "group " + std::to_string(group_id) + ": " : "";
+    }
     {
         /* the runner (and every algorithm object) lives on the group communicator */
         auto runner = make_runner<T>(o.coll, comm, o, op);
@@ -1277,7 +1621,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             MPI_Get_library_version(ver, &vlen);
             std::string v(ver, vlen);
             v = v.substr(0, v.find('\n'));
-            std::printf("# COLLAGE: COLLective AlGorithm bEnchmark\n");
+            std::printf("# collage: collective algorithm benchmark\n");
             std::printf("# MPI library  : %s\n", v.c_str());
             std::printf("# collective   : %s (%d ranks)\n", o.coll.c_str(), size);
             print_layout(o, size, groups, gsize, slots, node_of);
@@ -1350,7 +1694,17 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::printf("# distribution : %s (seed %u)\n", o.vdist.c_str(), o.seed);
             std::printf("# iterations   : %d (warmup %d), %d (warmup %d) above %s\n", o.iters, o.warmup,
                         o.iters_large, o.warmup_large, human_bytes(o.large_threshold).c_str());
-            std::printf("# check        : %s\n", o.check || o.check_only ? "against native MPI" : "off");
+            if (o.check || o.check_only) {
+                std::printf("# check        : result against %s%s%s%s\n",
+                            o.check_ref == "analytic" ? "an analytic reference" : "native MPI",
+                            o.check_steps ? "; every local reduction step" : "",
+                            o.check_msgs ? "; every message (checksums at both ends)" : "",
+                            o.check_iters > 0 ? ("; every " + std::to_string(o.check_iters) + " timed iterations").c_str() : "");
+                if (!o.inject.empty())
+                    std::printf("# inject       : %s (deliberate corruption: failures expected)\n", o.inject.c_str());
+            } else {
+                std::printf("# check        : off\n");
+            }
             if (o.split_mask > 0)
                 std::printf("# times        : latency in microseconds, mean over the ranks of a group,\n"
                             "#                averaged over the %d groups (all groups start together)\n", groups);
@@ -1362,6 +1716,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
         /* results[count index][variant index] */
         std::vector<std::vector<Cell>> results(counts.size(), std::vector<Cell>(variants.size()));
         size_t failures = 0;
+        uint64_t deep_red = 0, deep_msg = 0, deep_unv = 0; /* deep-check coverage (rank 0 reports) */
 
         for (size_t ci = 0; ci < counts.size(); ++ci) {
             const size_t n = counts[ci];
@@ -1387,11 +1742,14 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 runner->upload();
             }
 
-            /* reference result for verification */
+            /* reference result for verification: analytic (from the generated
+             * inputs of every rank, no communication) or what native MPI gives */
             bool have_ref = false;
             if (fits && (o.check || o.check_only) && runner->sized()) {
-                runner->native();
-                runner->snapshot();
+                if (o.check_ref != "analytic" || !runner->set_analytic_reference()) {
+                    runner->native();
+                    runner->snapshot();
+                }
                 have_ref = true;
             }
 
@@ -1417,15 +1775,59 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     if (have_ref) {
                         runner->setup(n);
                         runner->stage(v.base);
+                        /* deep checks (verify.hpp) on the algorithms, never on native */
+                        const bool deep = v.def && (o.check_steps || o.check_msgs || !o.inject.empty());
+                        if (deep) {
+                            vfy::begin(v.label + ", " + std::to_string(bytes) + " B");
+                            runner->register_regions();
+                            if (o.check_steps || vfy::st().inject.kind == vfy::Inject::Reduce)
+                                mem::st().reduce_check = &vfy::checked_reduce;
+                        }
+                        struct Off {
+                            bool on;
+                            ~Off() { if (on) { mem::st().reduce_check = nullptr; vfy::end(); } }
+                        } off{deep};
                         call();
-                        size_t bad = runner->compare();
+                        mem::st().reduce_check = nullptr;
+                        vfy::end();
+                        off.on = false;
+                        if (deep && o.check_msgs) vfy::exchange(comm);
+                        typename Runner<T>::Detail d;
+                        size_t bad = runner->compare(&d);
                         unsigned long long gbad = bad;
                         MPI_Allreduce(MPI_IN_PLACE, &gbad, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, world);
+                        std::vector<std::string> lines;
+                        uint64_t mchk = 0, munv = 0, nred = 0;
+                        const size_t findings = deep ? vfy::collect(world, lines, &mchk, &munv, &nred) : 0;
                         if (gbad) {
+                            int grank = 0;
+                            MPI_Comm_rank(comm, &grank);
+                            auto m = error_map(world, group_id, grank, gsize, d.bad, d.first, d.got, d.want,
+                                               d.blocks, runner->blocks_by_source());
+                            lines.insert(lines.end(), m.begin(), m.end());
+                        }
+                        if (gbad || findings) {
                             cell.state = Cell::Fail;
                             cell.note = std::to_string(gbad) + " wrong elements";
+                            if (deep) cell.note += ", " + std::to_string(findings) + " step/message findings";
                             ++failures;
+                            if (rank == 0) {
+                                std::printf("# check FAIL : %s %s, %zu bytes\n", o.coll.c_str(), v.label.c_str(), bytes);
+                                for (const std::string& l : lines) std::printf("#   %s\n", l.c_str());
+                                std::fflush(stdout);
+                            }
                         }
+                        if (deep && vfy::st().inject.kind != vfy::Inject::None) {
+                            int fired = vfy::st().inject.fired ? 1 : 0;
+                            MPI_Allreduce(MPI_IN_PLACE, &fired, 1, MPI_INT, MPI_MAX, world);
+                            if (!fired && rank == 0)
+                                std::printf("# inject       : %s did not fire in %s, %zu bytes (that rank does fewer "
+                                            "reductions or receives fewer messages from that source)\n",
+                                            o.inject.c_str(), v.label.c_str(), bytes);
+                        }
+                        deep_red += nred;
+                        deep_msg += mchk;
+                        deep_unv += munv;
                         runner->setup(n);
                     } else if (o.check || o.check_only) {
                         /* barrier: just make sure it completes */
@@ -1437,10 +1839,30 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     for (int w = 0; w < warm; ++w) call();
                     double sum = 0;
                     for (int it = 0; it < iters; ++it) {
+                        /* --check-iters N: verify every Nth timed iteration too
+                         * (restaged and compared outside the timed region) */
+                        const bool chk = have_ref && o.check_iters > 0 && (it + 1) % o.check_iters == 0;
+                        if (chk) {
+                            runner->setup(n);
+                            runner->stage(v.base);
+                        }
                         MPI_Barrier(world);
                         double t0 = MPI_Wtime();
                         call();
                         sum += MPI_Wtime() - t0;
+                        if (chk) {
+                            unsigned long long gb = runner->compare();
+                            MPI_Allreduce(MPI_IN_PLACE, &gb, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, world);
+                            if (gb) {
+                                if (cell.state != Cell::Fail) ++failures;
+                                cell.state = Cell::Fail;
+                                cell.note = std::to_string(gb) + " wrong elements in timed iteration " +
+                                            std::to_string(it + 1);
+                                if (rank == 0)
+                                    std::printf("# check FAIL : %s %s, %zu bytes: %s\n", o.coll.c_str(),
+                                                v.label.c_str(), bytes, cell.note.c_str());
+                            }
+                        }
                     }
                     double mine = iters > 0 ? sum / iters * 1e6 : 0.0;
                     double tot = 0, mn = 0, mx = 0;
@@ -1538,6 +1960,9 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             for (auto& kv : notes) std::printf("# n/a %s: %s\n", kv.first.c_str(), kv.second.c_str());
             if (o.check || o.check_only)
                 std::printf("# verification: %s\n", failures ? (std::to_string(failures) + " FAILED case(s)").c_str() : "all passed");
+            if ((o.check || o.check_only) && (o.check_steps || o.check_msgs))
+                std::printf("# deep check  : %llu local reductions and %llu messages verified\n",
+                            (unsigned long long)deep_red, (unsigned long long)deep_msg);
             if (o.gpu && runner->reduction()) {
                 const mem::State& ms = mem::st();
                 std::printf("# local reductions on rank 0: %zu kernel, %zu MPI_Reduce_local, %zu host-staged\n",

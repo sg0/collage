@@ -197,6 +197,7 @@ struct Request {
     Persist* p = nullptr;             /* Pers: emulated persistent request */
     int q = -1;                       /* Enq for cray: index of its queue */
     int u = -1;                       /* Enq for ucp/shmem: index of its operation */
+    int ck = -1;                      /* --check-msgs: index of its receive record (verify.hpp) */
 };
 
 inline bool operator==(const Request& a, const Request& b)

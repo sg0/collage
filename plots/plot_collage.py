@@ -416,7 +416,7 @@ def fig_best(df, a):
             ax.set_yticklabels([str(int(n)) for n in nodes], rotation=0)
             ax.set_xlabel("message size (bytes)")
             ax.set_ylabel("nodes")
-            ax.set_title(f"{coll}: best point-to-point algorithm per cell\n{config_label(cols, key)}\n"
+            ax.set_title(f"{coll}: best collage algorithm per cell\n{config_label(cols, key)}\n"
                          f"colour: its speedup over native MPI (blue faster, red slower); 0 B omitted",
                          loc="left", fontsize=8.5)
             fig.tight_layout()

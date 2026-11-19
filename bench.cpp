@@ -1,6 +1,7 @@
 /*
  * collage -- standalone benchmark for the Open MPI coll/base collective
- * algorithms, re-implemented on top of MPI point-to-point.
+ * algorithms, re-implemented as sends, receives and local reductions over a
+ * pluggable transport (MPI, stream-triggered, or device-initiated one-sided).
  *
  *   mpirun -np 64 ./collage -c allreduce -o sum -t float --check
  *   mpirun -np 64 ./collage -c bcast -a binomial,pipeline,native -s 0,8K,64K
@@ -70,7 +71,8 @@ void usage()
     std::printf(
         "usage: collage -c COLLECTIVE [options]\n"
         "\n"
-        "Benchmarks collective algorithms per pattern, implemented over a range of message sizes.\n"
+        "Benchmarks the Open MPI coll/base algorithms of one collective over a range\n"
+        "of message sizes, on MPI, stream-triggered or device-initiated transports.\n"
         "\n"
         "selection\n"
         "  -c, --coll NAME        allgather allgatherv allreduce alltoall alltoallv barrier\n"
@@ -125,8 +127,20 @@ void usage()
         "      --warmup-large N   warm-up iterations above --large (default 5)\n"
         "      --large BYTES      threshold for the large-message counts (default 64K)\n"
         "      --max-mem BYTES    skip cases needing more buffer memory per rank (default 2G)\n"
-        "      --check            verify every algorithm against the native MPI collective\n"
+        "      --check            verify every algorithm's result (analytic reference) and,\n"
+        "                         on failure, print a rank x block error map\n"
         "      --check-only       verify, do not time\n"
+        "      --check-ref R      analytic (default: from the generated inputs, independent of\n"
+        "                         MPI) | native (what the native MPI collective produces)\n"
+        "      --check-steps      also verify every local reduction step against a host\n"
+        "                         reference (finds the rank and step that computed wrong)\n"
+        "      --check-msgs       also checksum every message at both ends and compare them\n"
+        "                         per pair after the call (finds data corrupted in transit)\n"
+        "      --check-iters N    also verify every Nth timed iteration\n"
+        "      --inject SPEC      corrupt on purpose, to test the checks:\n"
+        "                         reduce:RANK:K[:ELEM]  the K-th local reduction on RANK\n"
+        "                         msg:SRC:DST:K[:BYTE]  the K-th message from SRC received on DST\n"
+        "                         (ranks within the group; K counts from 1)\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
         "      --tag TEXT         label copied into every CSV row (e.g. job id, study)\n"
         "  -q, --quiet            no table on stdout\n"
@@ -261,6 +275,15 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--max-mem") o.max_mem = parse_bytes(v());
         else if (a == "--check") o.check = true;
         else if (a == "--check-only") o.check_only = true;
+        else if (a == "--check-steps") o.check_steps = true;
+        else if (a == "--check-msgs") o.check_msgs = true;
+        else if (a == "--check-iters") o.check_iters = std::stoi(v());
+        else if (a == "--inject") o.inject = v();
+        else if (a == "--check-ref") {
+            o.check_ref = v();
+            if (o.check_ref != "analytic" && o.check_ref != "native")
+                throw std::invalid_argument("--check-ref must be analytic or native");
+        }
         else if (a == "--gpu") o.gpu = true;
         else if (a == "--gpu-reduce") {
             o.gpu_reduce = v();
@@ -305,6 +328,10 @@ Options parse(int argc, char** argv, bool& list, bool& help)
     if (o.iters < 0 || o.warmup < 0 || o.iters_large < 0 || o.warmup_large < 0)
         throw std::invalid_argument("iteration counts must be >= 0");
     if (o.split_mask < 0) throw std::invalid_argument("--split-mask must be >= 1");
+    if (o.check_iters < 0) throw std::invalid_argument("--check-iters must be >= 0");
+    /* the deep checks run in the verification pass: they imply --check */
+    if ((o.check_steps || o.check_msgs || !o.inject.empty() || o.check_iters > 0) && !o.check_only) o.check = true;
+    if (!o.inject.empty()) vfy::parse_inject(o.inject); /* validate early */
     return o;
 }
 
