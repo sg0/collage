@@ -198,6 +198,7 @@ struct Request {
     int q = -1;                       /* Enq for cray: index of its queue */
     int u = -1;                       /* Enq for ucp/shmem: index of its operation */
     int ck = -1;                      /* --check-msgs: index of its receive record (verify.hpp) */
+    int tr = -1;                      /* --trace: its request number in the trace (trace.hpp) */
 };
 
 inline bool operator==(const Request& a, const Request& b)

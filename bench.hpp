@@ -37,6 +37,7 @@
 #include "reduce_scatter_block.hpp"
 #include "scatter.hpp"
 #include "utils.hpp"
+#include "replay.hpp"
 
 namespace bench {
 
@@ -68,6 +69,8 @@ struct Options {
     std::string check_ref = "analytic";     /* --check-ref analytic|native */
     std::string inject;                     /* --inject SPEC */
     int check_iters = 0;                    /* --check-iters N: also verify every Nth timed iteration */
+    std::string trace_dir;                  /* --trace DIR */
+    std::string replay_dir;                 /* --replay DIR */
     bool native = true;                     /* include the native MPI baseline */
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
@@ -371,6 +374,14 @@ public:
         if (d) d->bad = bad;
         return bad;
     }
+    /* --trace: start recording one call on this runner's buffers */
+    void trace_begin(const std::string& label, const std::string& base, size_t bytes)
+    {
+        trc::begin(label, base, bytes, dt_, S(), sbuf_.size() * sizeof(T), R(), rbuf_.size() * sizeof(T));
+    }
+    /* --replay: the buffers a call runs on */
+    void* sptr() { return S(); }
+    void* rptr() { return R(); }
     /* name the user buffers for the step checks' messages */
     void register_regions()
     {
@@ -1612,7 +1623,76 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 if (!found) throw std::invalid_argument("collective '" + o.coll + "' has no algorithm '" + a + "'");
             }
         }
-        auto variants = expand(defs, o, op.op, o.native);
+        /* --replay: the recorded traces stand in for the algorithms */
+        trc::Trace trace;
+        std::vector<AlgoDef> replay_defs;
+        std::unique_ptr<trc::Replayer> replayer;
+        size_t replay_bytes = 0; /* the size being run (the call to replay) */
+        if (!o.replay_dir.empty()) {
+            std::string err;
+            try {
+                trace = trc::load(o.replay_dir, rank);
+                auto want = [&](const char* k, const std::string& v) {
+                    auto it = trace.meta.find(k);
+                    if (it == trace.meta.end() || it->second != v)
+                        err = std::string("--replay: the trace was recorded with ") + k + "=" +
+                              (it == trace.meta.end() ? "?" : it->second) + ", this run has " + k + "=" + v;
+                };
+                want("coll", o.coll);
+                want("type", type_name);
+                if (runner->reduction()) want("op", o.op);
+                want("world", std::to_string(size));
+                want("group", std::to_string(gsize));
+                want("root", std::to_string(o.root));
+                want("vdist", o.vdist);
+            } catch (const std::exception& x) {
+                err = x.what();
+            }
+            int bad = err.empty() ? 0 : 1;
+            MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, world);
+            if (bad) throw std::runtime_error(err.empty() ? "--replay: a trace does not match on another rank" : err);
+            replayer = std::make_unique<trc::Replayer>(comm, trace, TypeMap<T>(), op.op);
+            for (const std::string& l : trace.labels) {
+                const std::string& b = trace.base_of[l];
+                if (!o.algos.empty() && std::find(o.algos.begin(), o.algos.end(), b) == o.algos.end() &&
+                    std::find(o.algos.begin(), o.algos.end(), l) == o.algos.end())
+                    continue;
+                AlgoDef d;
+                d.name = "replay:" + l;
+                d.fn = [&, l](const AlgoParams&) {
+                    const trc::Call* c = trace.find(l, replay_bytes);
+                    if (!c) throw NotApplicable("size not in the trace");
+                    replayer->run(*c, runner->sptr(), runner->rptr());
+                };
+                replay_defs.push_back(d);
+            }
+        }
+        Options ov = o;
+        if (!o.replay_dir.empty()) ov.algos.clear();
+        auto variants = expand(o.replay_dir.empty() ? defs : replay_defs, ov, op.op, o.native);
+        for (Variant& v : variants)
+            if (v.def && v.base.rfind("replay:", 0) == 0) v.base = trace.base_of[v.base.substr(7)];
+        /* --trace: every rank records its own file */
+        struct TraceFile {
+            bool on = false;
+            ~TraceFile() { if (on) trc::close(); }
+        } trace_file;
+        if (!o.trace_dir.empty()) {
+            std::string err;
+            try {
+                trc::open(o.trace_dir, rank,
+                          "coll=" + o.coll + " type=" + type_name + " op=" + o.op + " world=" + std::to_string(size) +
+                              " group=" + std::to_string(gsize) + " root=" + std::to_string(o.root) +
+                              " vdist=" + o.vdist + " transport=" + o.transport + " gpu=" + (o.gpu ? "1" : "0") +
+                              " split=" + std::to_string(o.split_mask));
+                trace_file.on = true;
+            } catch (const std::exception& x) {
+                err = x.what();
+            }
+            int bad = err.empty() ? 0 : 1;
+            MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_MAX, world);
+            if (bad) throw std::runtime_error(err.empty() ? "--trace: cannot write a trace on another rank" : err);
+        }
         std::vector<size_t> counts = runner->sized() ? size_list(o, sizeof(T)) : std::vector<size_t>{0};
 
         if (rank == 0 && !o.quiet) {
@@ -1694,6 +1774,17 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::printf("# distribution : %s (seed %u)\n", o.vdist.c_str(), o.seed);
             std::printf("# iterations   : %d (warmup %d), %d (warmup %d) above %s\n", o.iters, o.warmup,
                         o.iters_large, o.warmup_large, human_bytes(o.large_threshold).c_str());
+            if (!o.trace_dir.empty())
+                std::printf("# trace        : recording one call per algorithm and size to %s/rank-NNNNN.trace\n",
+                            o.trace_dir.c_str());
+            if (!o.replay_dir.empty()) {
+                auto mt = [&](const char* k) {
+                    auto it = trace.meta.find(k);
+                    return it == trace.meta.end() ? std::string("?") : it->second;
+                };
+                std::printf("# replay       : %s: %zu recorded algorithm(s), recorded with transport=%s gpu=%s\n",
+                            o.replay_dir.c_str(), replay_defs.size(), mt("transport").c_str(), mt("gpu").c_str());
+            }
             if (o.check || o.check_only) {
                 std::printf("# check        : result against %s%s%s%s\n",
                             o.check_ref == "analytic" ? "an analytic reference" : "native MPI",
@@ -1769,9 +1860,24 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                     else runner->native();
                     xport::drain();
                 };
+                replay_bytes = bytes;
                 try {
                     if (v.def)
                         if (const char* why = xport::unsupported(o.coll, v.base)) throw NotApplicable(why);
+                    /* --trace: one recorded call per (algorithm, size) */
+                    if (fits && v.def && !o.trace_dir.empty()) {
+                        runner->setup(n);
+                        runner->stage(v.base);
+                        runner->trace_begin(v.label, v.base, bytes);
+                        struct Stop {
+                            bool on = true;
+                            ~Stop() { if (on) trc::abort_call(); }
+                        } stop;
+                        call();
+                        trc::end();
+                        stop.on = false;
+                        runner->setup(n);
+                    }
                     if (have_ref) {
                         runner->setup(n);
                         runner->stage(v.base);
@@ -1960,6 +2066,9 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             for (auto& kv : notes) std::printf("# n/a %s: %s\n", kv.first.c_str(), kv.second.c_str());
             if (o.check || o.check_only)
                 std::printf("# verification: %s\n", failures ? (std::to_string(failures) + " FAILED case(s)").c_str() : "all passed");
+            if (!o.trace_dir.empty())
+                std::printf("# trace        : rank 0 recorded %llu calls, %llu operations\n",
+                            (unsigned long long)trc::st().total_calls, (unsigned long long)trc::st().total_ops);
             if ((o.check || o.check_only) && (o.check_steps || o.check_msgs))
                 std::printf("# deep check  : %llu local reductions and %llu messages verified\n",
                             (unsigned long long)deep_red, (unsigned long long)deep_msg);

@@ -137,6 +137,12 @@ void usage()
         "      --check-msgs       also checksum every message at both ends and compare them\n"
         "                         per pair after the call (finds data corrupted in transit)\n"
         "      --check-iters N    also verify every Nth timed iteration\n"
+        "      --trace DIR        record every algorithm (one call per size) to\n"
+        "                         DIR/rank-NNNNN.trace: its sends, receives, waits,\n"
+        "                         reductions and copies, in program order\n"
+        "      --replay DIR       run the traces in DIR instead of the algorithms\n"
+        "                         (variants replay:ALGO), on this run's transport and\n"
+        "                         memory space; -a filters by algorithm\n"
         "      --inject SPEC      corrupt on purpose, to test the checks:\n"
         "                         reduce:RANK:K[:ELEM]  the K-th local reduction on RANK\n"
         "                         msg:SRC:DST:K[:BYTE]  the K-th message from SRC received on DST\n"
@@ -279,6 +285,8 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--check-msgs") o.check_msgs = true;
         else if (a == "--check-iters") o.check_iters = std::stoi(v());
         else if (a == "--inject") o.inject = v();
+        else if (a == "--trace") o.trace_dir = v();
+        else if (a == "--replay") o.replay_dir = v();
         else if (a == "--check-ref") {
             o.check_ref = v();
             if (o.check_ref != "analytic" && o.check_ref != "native")

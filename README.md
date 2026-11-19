@@ -1,4 +1,4 @@
-## COLLAGE — COLLective AlGorithm bEnchmark
+# COLLAGE — COLLective AlGorithm bEnchmark
 
 `collage` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
@@ -16,12 +16,14 @@ I would like to acknowledge the implicit generosity and dedication of the MPI
 implementers, researchers, and, broadly the MPI Forum for continuing to steer 
 HPC ahead.
 
+
 ## Layout
 
 | file | contents |
 |---|---|
 | `utils.hpp` | type map, reduction ops, `CollBase` (dup'ed communicator, large-count-aware send/receive wrappers over the transport layer, local reductions), port of `coll_base_topo.c` (binary/k-ary, binomial, in-order binomial, in-order binary, k-nomial and chain trees) |
 | `verify.hpp` | deep verification: per-step reduction checks, per-message checksums and their exchange, fault injection (`--check-steps`, `--check-msgs`, `--inject`) |
+| `trace.hpp`, `replay.hpp` | communication traces: recording (`--trace`), the trace format, and the host-driven replayer (`--replay`) |
 | `allgather.hpp` … `scatter.hpp` | one class template per collective, `Coll<T>`, one member function per algorithm |
 | `transport.hpp` | transport layer: how the algorithms' messages are issued — plain (CUDA-aware) MPI, stream-triggered through MPICH's, NVIDIA MPI-ACX's or Cray MPICH's enqueue APIs, or device-initiated one-sided UCX or NVSHMEM (`--transport`) |
 | `onesided_transport.hpp`, `onesided_proto.hpp`, `onesided_device_ops.hpp`, `onesided_device.cu` | `--transport ucp` and `--transport shmem`: the device-initiated one-sided engine (host setup per back end: UCX or NVSHMEM), shared layouts, the GPU protocol (one copy, a few primitives per back end), and its kernels |
@@ -31,6 +33,8 @@ HPC ahead.
 | `collage_op_plugin.h`, `examples/op_plugin_absmax.cu` | plugin ABI for custom reduction operators with a CUDA kernel (`-o plugin:PATH`), and a complete example |
 | `bench.hpp` | one runner per collective (buffers, init, native reference, verification), the sweep/timing harness, CSV output |
 | `bench.cpp` | command-line driver, runtime datatype dispatch |
+| `tools/collage2goal.py`, `tools/collage2dumpi.py`, `tools/collage_trace.py` | trace converters for network simulators
+(experimental): GOAL (LogGOPSim, ATLAHS) and SST DUMPI (SST/macro), and the trace reader they share |
 | `scripts/` | Slurm job scripts for parameter studies on NERSC Perlmutter (see [scripts/README.md](scripts/README.md)) |
 | `plots/plot_collage.py` | seaborn figures from the CSV output of those studies (or any `--csv` file) |
 
@@ -109,6 +113,9 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--check-steps` | also verify every local reduction step against a host reference: names the rank and step that computed wrong | off |
 | `--check-msgs` | also checksum every message at both ends and compare per pair after the call: names the link that corrupted data | off |
 | `--check-iters N` | also verify every Nth timed iteration (restaged and compared outside the timed region) | off |
+| `--trace DIR` | record every algorithm, one call per size, to `DIR/rank-NNNNN.trace` (created if missing) | off |
+| `--trace-times` | with `--trace`: also record each operation's start and end (ns), for the simulator converters | off |
+| `--replay DIR` | run the recorded traces instead of the algorithms, as variants `replay:ALGO`, on this run's transport and memory space | off |
 | `--inject SPEC` | deliberately corrupt `reduce:RANK:K[:ELEM]` (the K-th local reduction on RANK) or `msg:SRC:DST:K[:BYTE]` (the K-th message from SRC received on DST), to test the checks | off |
 | `--csv FILE` | `avg/min/max` µs and algorithmic bandwidth per (variant, size) | – |
 | `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
@@ -761,6 +768,127 @@ The comparison is exact for data movement and for the low-precision types.
 Floating-point reductions allow 1e-5 (float) or 1e-12 (double) relative
 error, although the generated inputs keep them exact in practice. 
 
+## Traces and replay
+
+```bash
+mpirun -np 64 ./collage -c allreduce --trace tr                    # record (host, any transport)
+mpirun -np 64 ./collage -c allreduce --replay tr --gpu --transport cray --check   # replay elsewhere
+```
+
+`--trace DIR` adds one pass per (algorithm, size), before verification.
+Every rank writes the operations it performs, in program order, to
+`DIR/rank-NNNNN.trace`:
+* sends (`S`, synchronous `Z`) and receives (`R`), with communicator, peer,
+  tag, buffer, offset and size;
+* the waits that complete them (`W`, waitany `Y`);
+* local reductions (`X`) and copies (`C`);
+* allocations and frees of temporary buffers (`A`, `F`).
+
+The format is plain text, one operation per line, and is documented at the
+top of `trace.hpp`. Derived datatypes (Bruck's indexed types) are recorded as
+byte blocks.
+
+`--replay DIR` runs these traces instead of the algorithms. Each recorded
+algorithm becomes a variant `replay:<algorithm>`, timed, verified and
+reported like any other, next to the native collective. Every operation goes
+through the same send/receive/reduce layer the algorithms use, so a trace
+recorded on one configuration replays on any other with the same rank
+counts:
+* host or `--gpu` memory;
+* any transport (`mpi`, `cray`, `mpich`, `acx`, `ucp`, `shmem`);
+* a different MPI library.
+
+The replay must match the recording's collective, type, op, root, count
+distribution and rank counts, and stops with an error if it doesn't. `-a`
+filters by algorithm name.
+
+What a replay keeps and what it drops:
+* **Kept, exactly:** every message's size, peer, tag and communicator; the
+  dependencies (which wait completes which request); the reductions and
+  copies, with their buffers and offsets. `--check` (and `--check-steps`,
+  `--check-msgs`) verify a replayed result like an algorithm's.
+* **Dropped:** the algorithm's decisions. Persistent requests replay as one
+  nonblocking operation per start. `MPI_Waitany` replays as a waitany over
+  the same requests, but the operations after it are the ones recorded. An
+  algorithm whose control flow depends on received counts replays the path
+  it took when recorded.
+* **Timing differences:** a replay does no tree or schedule computation and
+  creates its derived datatypes once, outside the timed region. Replay
+  times are therefore a little below the algorithm's own, and the gap is the
+  cost of the algorithm's bookkeeping.
+
+`--trace-times` also records when each operation starts and ends, in ns from
+the start of the call on that rank (` @ t0 t1` at the end of each line). The
+replayer ignores the times. The simulator converters below use them.
+
+### Simulators: LogGOPSim / ATLAHS (GOAL) and SST/macro (DUMPI)
+
+This is experimental.
+
+Two converters in `tools/` turn a trace into the input of a network
+simulator. They are plain Python 3 with no dependencies, and they write one
+schedule per recorded (algorithm, size). Peers become world ranks, so traces
+taken with `--split-mask` simulate every group at once.
+
+```bash
+mpirun -np 64 ./collage -c allreduce -a ring,rabenseifner --sizes 1M --trace tr --trace-times
+
+# LogGOPSim, or the LogGOPSim and htsim back ends of ATLAHS
+tools/collage2goal.py tr -o goal                 # goal/ring-1048576.goal, ...
+txt2bin -i goal/ring-1048576.goal -o ring.bin
+LogGOPSim -f ring.bin -L 3000 -o 1000 -g 1000 -G 1 -S 65536
+
+# SST/macro
+tools/collage2dumpi.py tr -o dumpi               # needs sst-dumpi's ascii2dumpi on PATH
+cd dumpi/ring-1048576 && sstmac -f sstmac.ini    # edit the machine model in sstmac.ini
+```
+
+How the operations map:
+
+| trace | GOAL (`collage2goal.py`) | DUMPI (`collage2dumpi.py`) |
+|---|---|---|
+| `S`, `Z`, `R` | `send` / `recv`, size in bytes | `MPI_Isend` / `MPI_Issend` / `MPI_Irecv`, `MPI_BYTE` on `MPI_COMM_WORLD` |
+| `W` | a `calc 0` join that `requires` the completed operations | `MPI_Wait` (one request) or `MPI_Waitall` |
+| `Y` | a join on the request that completed when recorded | `MPI_Waitany` with that index |
+| `X`, `C` | `calc` nodes | time between calls, which SST/macro replays as compute |
+| `A`, `F` | dropped | dropped |
+
+* **Messages.** Derived datatypes become the bytes they cover. The tag
+  folds in the communicator, `(cid << 20) | tag`, so messages of different
+  recorded communicators never match. A wildcard source stays -1.
+* **Order.** In GOAL, every operation requires the last blocking point
+  before it (a wait, reduction or copy), which keeps the host's program
+  order. The real overlap is kept too: everything posted between two waits
+  can be in flight at once. DUMPI keeps the call sequence as recorded.
+* **Compute** (`--compute`):
+  * `measured` (the default for a timed trace) uses the recorded durations.
+    In DUMPI it keeps the recorded wall-clock time of every call.
+  * `model` uses bytes / `--reduce-gbs` or `--copy-gbs` (1 GB/s = 1 byte/ns).
+  * `zero` models communication only.
+
+  For GOAL, `--gaps` also turns the host time no record covers (the
+  algorithm's bookkeeping) into `calc` nodes.
+* **Repetition.** `--iters N` chains N instances of the call. `--call` and
+  `--bytes` select one.
+* **Units.** LogGOPSim's times are ns.
+  * Upstream LogGOPSim takes `G` (ns per byte) as an integer.
+  * ATLAHS's copy accepts a fraction (`-G 0.04` is 25 GB/s).
+  * `-S` sets the eager/rendezvous threshold.
+* **SST/macro.** The generated `sstmac.ini` is a small packet-level (pisces)
+  1-D torus, sized to the trace. Replace its `node`, `switch` and `topology`
+  blocks with a model of your machine (SST/macro ships several under
+  `configurations/`).
+
+  Keep the `mpi` block it sets (`max_vshort_msg_size` = `max_eager_msg_size`).
+  SST/macro's middle "eager1" protocol, 513 B to 8 KiB by default, matches a
+  message only when its payload arrives. A smaller message sent after it on
+  the same tag then overtakes it, which breaks MPI's ordering; gather
+  `linear_sync` hits this. With the two thresholds equal, messages are eager
+  up to the threshold and rendezvous above it, and order is preserved.
+
+Measured compute times come from the recording host. On an oversubscribed or
+noisy machine, prefer `--compute model`.
+
 ## Cost model
 
 [COST_MODEL.md](COST_MODEL.md) has two tables, latency (α) and bandwidth
@@ -769,7 +897,7 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Studies on Perlmutter
+## Job runs
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and

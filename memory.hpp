@@ -107,6 +107,14 @@ struct State {
     std::vector<DeviceOp> device_ops;
     /* verification hook (verify.hpp): replaces reduce() while it is set */
     void (*reduce_check)(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op) = nullptr;
+    /* trace hooks (trace.hpp): record the algorithm's local operations */
+    struct TraceHooks {
+        void (*alloc)(const void* p, size_t bytes);
+        void (*release)(const void* p);
+        void (*copy)(void* dst, const void* src, size_t bytes);
+        void (*reduce)(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op);
+    };
+    const TraceHooks* trace = nullptr;
 };
 
 inline State& st()
@@ -309,6 +317,7 @@ inline void queued()
 inline void copy(void* dst, const void* src, size_t bytes)
 {
     if (bytes == 0 || dst == src) return;
+    if (st().trace) st().trace->copy(dst, src, bytes);
 #if defined(COLLAGE_CUDA)
     if (device()) {
         before_stream_op();
@@ -532,6 +541,7 @@ inline void reduce_impl(const void* in, void* inout, size_t count, MPI_Datatype 
 inline void reduce(const void* in, void* inout, size_t count, MPI_Datatype dt, MPI_Op op)
 {
     if (0 == count) return;
+    if (st().trace) st().trace->reduce(in, inout, count, dt, op);
     if (st().reduce_check) {
         st().reduce_check(in, inout, count, dt, op); /* calls reduce_impl itself */
         return;
@@ -582,11 +592,13 @@ public:
         if (dev_) {
             p_ = static_cast<T*>(mem::device_alloc(n * sizeof(T)));
             n_ = n;
+            if (mem::st().trace) mem::st().trace->alloc(p_, n * sizeof(T));
             return;
         }
 #endif
         p_ = new T[n]();
         n_ = n;
+        if (mem::st().trace) mem::st().trace->alloc(p_, n * sizeof(T));
     }
     T* data() { return p_; }
     const T* data() const { return p_; }
@@ -601,6 +613,7 @@ private:
     void release()
     {
         if (!p_) return;
+        if (mem::st().trace) mem::st().trace->release(p_);
 #if defined(COLLAGE_CUDA)
         if (dev_) mem::device_free(p_);
         else delete[] p_;
