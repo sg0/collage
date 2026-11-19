@@ -140,6 +140,8 @@ void usage()
         "      --trace DIR        record every algorithm (one call per size) to\n"
         "                         DIR/rank-NNNNN.trace: its sends, receives, waits,\n"
         "                         reductions and copies, in program order\n"
+        "      --trace-times      also record when every traced operation starts and ends\n"
+        "                         (ns; for simulators: compute time between messages)\n"
         "      --replay DIR       run the traces in DIR instead of the algorithms\n"
         "                         (variants replay:ALGO), on this run's transport and\n"
         "                         memory space; -a filters by algorithm\n"
@@ -149,6 +151,8 @@ void usage()
         "                         (ranks within the group; K counts from 1)\n"
         "      --csv FILE         write per-(algorithm,size) statistics to FILE\n"
         "      --tag TEXT         label copied into every CSV row (e.g. job id, study)\n"
+        "      --bw MODE          bandwidth tables after the latencies (GB/s): bus (bus\n"
+        "                         bandwidth, nccl-tests' busbw; default) | alg | both | none\n"
         "  -q, --quiet            no table on stdout\n"
         "\n"
         "GPU buffers (needs a CUDA-aware MPI and a build with `make CUDA=1`)\n"
@@ -286,6 +290,7 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--check-iters") o.check_iters = std::stoi(v());
         else if (a == "--inject") o.inject = v();
         else if (a == "--trace") o.trace_dir = v();
+        else if (a == "--trace-times") o.trace_times = true;
         else if (a == "--replay") o.replay_dir = v();
         else if (a == "--check-ref") {
             o.check_ref = v();
@@ -324,6 +329,11 @@ Options parse(int argc, char** argv, bool& list, bool& help)
         else if (a == "--ucp-timeout" || a == "--shmem-timeout") o.os_timeout = std::stod(v());
         else if (a == "--thread-multiple") o.thread_multiple = true;
         else if (a == "-q" || a == "--quiet") o.quiet = true;
+        else if (a == "--bw") {
+            o.bw = v();
+            if (o.bw != "bus" && o.bw != "alg" && o.bw != "both" && o.bw != "none")
+                throw std::invalid_argument("--bw: bus, alg, both or none");
+        }
         else if (a == "--split-mask" || a == "-split-mask") parse_split(v(), o);
         else if (a[0] != '-' && o.coll.empty()) o.coll = a;
         else throw std::invalid_argument("unknown option '" + a + "' (see --help)");

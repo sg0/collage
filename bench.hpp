@@ -70,10 +70,12 @@ struct Options {
     std::string inject;                     /* --inject SPEC */
     int check_iters = 0;                    /* --check-iters N: also verify every Nth timed iteration */
     std::string trace_dir;                  /* --trace DIR */
+    bool trace_times = false;               /* --trace-times */
     std::string replay_dir;                 /* --replay DIR */
     bool native = true;                     /* include the native MPI baseline */
     size_t max_mem = (size_t)2 << 30;       /* per-rank buffer limit, bytes */
     std::string csv;                        /* write full statistics */
+    std::string bw = "bus";                 /* bandwidth tables on stdout: bus | alg | both | none */
     std::string tag;                        /* free-form label copied into every CSV row */
     bool quiet = false;
     int split_mask = 0;                     /* >0: run on N/M concurrent groups of M ranks */
@@ -275,6 +277,13 @@ public:
     virtual size_t mem_bytes(size_t count) const = 0;
     /* bytes moved per rank and per call, used for the bandwidth column */
     virtual double payload_bytes(size_t count) const { return (double)count * sizeof(T); }
+    /* bus bandwidth = algbw * bus_factor() (nccl-tests' convention, doc/PERFORMANCE.md):
+     * the factor turns algbw (payload_bytes / time) into the bandwidth each rank's
+     * link must sustain under an optimal algorithm, so that it is comparable with
+     * the hardware peak and across collectives and algorithms. It depends only on
+     * the collective and the number of ranks n, never on the algorithm or op. */
+    virtual double bus_factor() const { return 1.0; }
+    virtual const char* bus_rule() const { return "1"; }
     /* allocate and initialise inputs, poison outputs */
     virtual void setup(size_t count) = 0;
     /* called before a verified run (e.g. to make rbuf hold the in-place input) */
@@ -554,6 +563,8 @@ public:
     AllreduceRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     bool reduction() const override { return true; }
     const char* size_semantics() const override { return "bytes reduced per rank"; }
+    double bus_factor() const override { return 2.0 * (this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "2(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return 3 * n * sizeof(T); }
     void setup(size_t n) override
     {
@@ -598,6 +609,8 @@ class AllgatherRunner : public Runner<T> {
 public:
     AllgatherRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "bytes contributed per rank"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return (1 + 2 * (size_t)this->size_) * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -653,6 +666,8 @@ class AllgathervRunner : public Runner<T> {
 public:
     AllgathervRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "average bytes contributed per rank (--vdist)"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return (1 + 4 * (size_t)this->size_) * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -715,6 +730,8 @@ class AlltoallRunner : public Runner<T> {
 public:
     AlltoallRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "bytes sent to each peer"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return 4 * (size_t)this->size_ * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -780,6 +797,8 @@ class AlltoallvRunner : public Runner<T> {
 public:
     AlltoallvRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "average bytes sent to each peer (--vdist)"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return 6 * (size_t)this->size_ * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -856,6 +875,8 @@ class GatherRunner : public Runner<T> {
 public:
     GatherRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "bytes contributed per rank"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return (1 + 3 * (size_t)this->size_) * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -912,6 +933,8 @@ class ScatterRunner : public Runner<T> {
 public:
     ScatterRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     const char* size_semantics() const override { return "bytes received per rank"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return (2 + 2 * (size_t)this->size_) * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -955,6 +978,8 @@ public:
     BarrierRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     bool sized() const override { return false; }
     const char* size_semantics() const override { return "(no data)"; }
+    double bus_factor() const override { return 0.0; }
+    const char* bus_rule() const override { return "-"; }
     size_t mem_bytes(size_t) const override { return 0; }
     double payload_bytes(size_t) const override { return 0; }
     void setup(size_t) override { this->count_ = 0; }
@@ -983,6 +1008,8 @@ public:
     ReduceScatterRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     bool reduction() const override { return true; }
     const char* size_semantics() const override { return "average bytes received per rank (--vdist)"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return 5 * (size_t)this->size_ * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -1031,6 +1058,8 @@ public:
     ReduceScatterBlockRunner(MPI_Comm comm, const Options& o, const OpInfo& op) : B(comm, o, op), c_(comm) {}
     bool reduction() const override { return true; }
     const char* size_semantics() const override { return "bytes received per rank"; }
+    double bus_factor() const override { return (double)(this->size_ - 1) / this->size_; }
+    const char* bus_rule() const override { return "(n-1)/n"; }
     size_t mem_bytes(size_t n) const override { return 5 * (size_t)this->size_ * n * sizeof(T); }
     double payload_bytes(size_t n) const override { return (double)n * sizeof(T) * this->size_; }
     void setup(size_t n) override
@@ -1091,6 +1120,19 @@ std::unique_ptr<Runner<T>> make_runner(const std::string& c, MPI_Comm comm, cons
 
 /* ------------------------------------------------------------------------- */
 /* harness                                                                    */
+/* what S (the algbw numerator) is, per collective (nccl-tests' conventions) */
+inline std::string bw_size_text(const std::string& c)
+{
+    if (c == "bcast") return "bytes broadcast";
+    if (c == "reduce" || c == "allreduce") return "bytes reduced per rank";
+    if (c == "allgather" || c == "allgatherv") return "bytes per rank * n (the gathered result)";
+    if (c == "gather") return "bytes per rank * n (the root's result)";
+    if (c == "scatter") return "bytes per rank * n (the root's input)";
+    if (c == "alltoall" || c == "alltoallv") return "bytes per peer * n (each rank's send buffer)";
+    if (c == "reduce_scatter" || c == "reduce_scatter_block") return "bytes per rank * n (each rank's input)";
+    return "-";
+}
+
 /* ------------------------------------------------------------------------- */
 struct Variant {
     std::string label;
@@ -1679,12 +1721,22 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
         } trace_file;
         if (!o.trace_dir.empty()) {
             std::string err;
+            /* the world ranks of my group, in group-rank order (peers in a trace are group ranks) */
+            std::vector<int> members((size_t)gsize);
+            MPI_Allgather(&rank, 1, MPI_INT, members.data(), 1, MPI_INT, comm);
+            std::string mem_s;
+            for (int m : members) mem_s += (mem_s.empty() ? "" : ",") + std::to_string(m);
+            int grank = 0;
+            MPI_Comm_rank(comm, &grank);
+            trc::st().times = o.trace_times;
             try {
                 trc::open(o.trace_dir, rank,
                           "coll=" + o.coll + " type=" + type_name + " op=" + o.op + " world=" + std::to_string(size) +
                               " group=" + std::to_string(gsize) + " root=" + std::to_string(o.root) +
                               " vdist=" + o.vdist + " transport=" + o.transport + " gpu=" + (o.gpu ? "1" : "0") +
-                              " split=" + std::to_string(o.split_mask));
+                              " split=" + std::to_string(o.split_mask) + " esize=" + std::to_string(sizeof(T)) +
+                              " rank=" + std::to_string(rank) + " grank=" + std::to_string(grank) +
+                              " times=" + (o.trace_times ? "1" : "0") + " members=" + mem_s);
                 trace_file.on = true;
             } catch (const std::exception& x) {
                 err = x.what();
@@ -1801,6 +1853,11 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                             "#                averaged over the %d groups (all groups start together)\n", groups);
             else
                 std::printf("# times        : average latency in microseconds (mean over ranks)\n");
+            if (runner->sized() && !o.check_only && o.bw != "none")
+                std::printf("# bandwidth    : GB/s, after the latencies; algbw = S / time, busbw = algbw * %s\n"
+                            "#                (n = %d ranks%s; nccl-tests' definitions), S = %s\n",
+                            runner->bus_rule(), gsize, o.split_mask > 0 ? " per group" : "",
+                            bw_size_text(o.coll).c_str());
             std::fflush(stdout);
         }
 
@@ -2031,28 +2088,48 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
             }
         }
 
-        /* with concurrent groups, also report the aggregate bandwidth */
-        if (rank == 0 && !o.quiet && o.split_mask > 0 && !o.check_only && runner->sized()) {
-            std::printf("#\n# aggregate bandwidth in MB/s: sum over the %d groups of\n"
-                        "# (bytes per rank: %s) / (group latency)\n", groups, runner->size_semantics());
-            std::printf("%-12s", "# bytes");
-            for (auto& v : variants) std::printf(" %*s", (int)std::max<size_t>(12, v.label.size()), v.label.c_str());
-            std::printf("\n");
-            for (size_t ci = 0; ci < counts.size(); ++ci) {
-                std::printf("%-12zu", counts[ci] * sizeof(T));
-                for (size_t vi = 0; vi < variants.size(); ++vi) {
-                    const Cell& c = results[ci][vi];
-                    int w = (int)std::max<size_t>(12, variants[vi].label.size());
-                    char buf[64];
-                    switch (c.state) {
-                        case Cell::Ok: std::snprintf(buf, sizeof buf, "%.2f", c.aggbw); break;
-                        case Cell::NA: std::snprintf(buf, sizeof buf, "n/a"); break;
-                        case Cell::Skip: std::snprintf(buf, sizeof buf, "skip"); break;
-                        case Cell::Fail: std::snprintf(buf, sizeof buf, "FAIL:%.2f", c.aggbw); break;
-                    }
-                    std::printf(" %*s", w, buf);
-                }
+        /* bandwidth tables (GB/s): per group, and summed over the groups with --split-mask */
+        if (rank == 0 && !o.quiet && !o.check_only && runner->sized() && o.bw != "none") {
+            const double bf = runner->bus_factor();
+            auto table = [&](const char* title, bool agg, double factor) {
+                std::printf("#\n# %s\n", title);
+                std::printf("%-12s", "# bytes");
+                for (auto& v : variants) std::printf(" %*s", (int)std::max<size_t>(12, v.label.size()), v.label.c_str());
                 std::printf("\n");
+                for (size_t ci = 0; ci < counts.size(); ++ci) {
+                    std::printf("%-12zu", counts[ci] * sizeof(T));
+                    const double pb = runner->payload_bytes(counts[ci]);
+                    for (size_t vi = 0; vi < variants.size(); ++vi) {
+                        const Cell& c = results[ci][vi];
+                        int w = (int)std::max<size_t>(12, variants[vi].label.size());
+                        /* B/us = MB/s; /1e3 -> GB/s */
+                        const double alg = agg ? c.aggbw : (c.avg > 0 ? pb / c.avg : 0.0);
+                        const double val = alg * factor / 1e3;
+                        char buf[64];
+                        switch (c.state) {
+                            case Cell::Ok: std::snprintf(buf, sizeof buf, "%.3f", val); break;
+                            case Cell::NA: std::snprintf(buf, sizeof buf, "n/a"); break;
+                            case Cell::Skip: std::snprintf(buf, sizeof buf, "skip"); break;
+                            case Cell::Fail: std::snprintf(buf, sizeof buf, "FAIL:%.3f", val); break;
+                        }
+                        std::printf(" %*s", w, buf);
+                    }
+                    std::printf("\n");
+                }
+            };
+            const bool want_alg = o.bw == "alg" || o.bw == "both", want_bus = o.bw == "bus" || o.bw == "both";
+            if (want_alg) table("algbw in GB/s (S / time)", false, 1.0);
+            if (want_bus) table("busbw in GB/s (algbw * bus factor)", false, bf);
+            if (o.split_mask > 0) {
+                char t[160];
+                if (want_alg) {
+                    std::snprintf(t, sizeof t, "aggregate algbw in GB/s: sum over the %d groups of S / (group latency)", groups);
+                    table(t, true, 1.0);
+                }
+                if (want_bus) {
+                    std::snprintf(t, sizeof t, "aggregate busbw in GB/s: sum over the %d groups of the group's busbw", groups);
+                    table(t, true, bf);
+                }
             }
             std::fflush(stdout);
         }
@@ -2124,7 +2201,7 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                 std::replace(csv_tag.begin(), csv_tag.end(), ',', ';');
                 std::fprintf(f, "collective,algorithm,variant,type,op,ranks,nodes,ranks_per_node,buffers,gpu_reduce,"
                                 "transport,groups,group_ranks,layout,root,bytes,count,"
-                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,tag,note\n");
+                                "status,avg_us,min_us,max_us,group_min_us,group_max_us,algbw_MBps,aggbw_MBps,busbw_MBps,aggbusbw_MBps,tag,note\n");
                 for (size_t ci = 0; ci < counts.size(); ++ci)
                     for (size_t vi = 0; vi < variants.size(); ++vi) {
                         const Cell& c = results[ci][vi];
@@ -2145,11 +2222,12 @@ int run(MPI_Comm world, const Options& o, const std::string& type_name)
                             return q + "\"";
                         };
                         const std::string csv_variant = field(variants[vi].label), csv_layout = field(layout);
-                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%s,%s\n",
+                        std::fprintf(f, "%s,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,%d,%s,%d,%zu,%zu,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%s,%s\n",
                                      o.coll.c_str(), variants[vi].base.c_str(), csv_variant.c_str(),
                                      type_name.c_str(), runner->reduction() ? op.name.c_str() : "-", size, csv_nodes,
                                      csv_ppn, csv_buffers.c_str(), csv_reduce.c_str(), csv_transport.c_str(), groups, gsize, csv_layout.c_str(),
                                      o.root, bytes, counts[ci], st, c.avg, c.min, c.max, c.gmin, c.gmax, bw, c.aggbw,
+                                     bw * runner->bus_factor(), c.aggbw * runner->bus_factor(),
                                      csv_tag.c_str(), note.c_str());
                     }
                 std::fclose(f);

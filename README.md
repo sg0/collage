@@ -11,11 +11,9 @@ default the range is 0 B to 4 MiB in powers of two. It can optionally check
 each result against an exact reference.
 
 The algorithm set is the one in the original headers. No algorithms were added.
-
 I would like to acknowledge the implicit generosity and dedication of the MPI 
 implementers, researchers, and, broadly the MPI Forum for continuing to steer 
 HPC ahead.
-
 
 ## Layout
 
@@ -116,7 +114,8 @@ mpirun -np 7 ./collage -c reduce_scatter -o user_nc --check-only
 | `--trace-times` | with `--trace`: also record each operation's start and end (ns), for the simulator converters | off |
 | `--replay DIR` | run the recorded traces instead of the algorithms, as variants `replay:ALGO`, on this run's transport and memory space | off |
 | `--inject SPEC` | deliberately corrupt `reduce:RANK:K[:ELEM]` (the K-th local reduction on RANK) or `msg:SRC:DST:K[:BYTE]` (the K-th message from SRC received on DST), to test the checks | off |
-| `--csv FILE` | `avg/min/max` µs and algorithmic bandwidth per (variant, size) | – |
+| `--bw MODE` | bandwidth tables (GB/s) after the latency table: `bus` (bus bandwidth), `alg`, `both` or `none` | `bus` |
+| `--csv FILE` | `avg/min/max` µs, algorithm and bus bandwidth per (variant, size) | – |
 | `--split-mask M[:K\|:p]` | run on N/M concurrent communicators of M ranks; members consecutive, K apart, or randomised by p (see below) | off |
 | `--gpu` | user buffers and all algorithm temporaries in GPU memory (needs `make CUDA=1`, CUDA-aware MPI) | off |
 | `--gpu-reduce MODE` | local reductions on GPU data: `kernel`, `mpi` or `host` (see below) | `kernel` |
@@ -163,7 +162,43 @@ CSV file also has the min and max over ranks. Other cell values:
 * `skip`: the case would exceed `--max-mem`.
 * `FAIL:...`: `--check` found wrong results.
 
-With `--csv FILE`, one row per (algorithm variant, size) is written. A variant
+### Bandwidth: algbw and busbw
+
+After the latency table, collage prints the bus bandwidth of every cell in
+GB/s. It follows the definitions of
+[nccl-tests](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md):
+
+* `algbw = S / time`, where S is the data the collective is defined over (below).
+* `busbw = algbw * factor`. The factor turns algbw into the rate each rank's
+  link must sustain under an optimal algorithm. Busbw can therefore be
+  compared with the hardware's peak bandwidth, and across collectives and
+  rank counts. Algbw drops as ranks are added even when the links are
+  saturated.
+
+| collective | S | busbw factor |
+|---|---|---|
+| allreduce | bytes reduced per rank | 2(n-1)/n |
+| reduce_scatter, reduce_scatter_block | bytes received per rank × n (each rank's input) | (n-1)/n |
+| allgather, allgatherv | bytes contributed per rank × n (the result) | (n-1)/n |
+| alltoall, alltoallv | bytes sent to each peer × n (each rank's send buffer) | (n-1)/n |
+| gather, scatter | bytes per rank × n (the root's buffer) | (n-1)/n |
+| bcast, reduce | bytes broadcast / reduced | 1 |
+| barrier | – | – |
+
+n is the number of ranks in the communicator (the group size with
+`--split-mask`). For the `v` variants, S uses the average size per rank
+(`--vdist`). The factor depends only on the collective and n, never on the
+algorithm or the reduction operation. So within a table, busbw ranks the
+algorithms exactly as latency does, and an algorithm moving more data than
+the optimum (e.g. linear, or `allgather_reduce`) shows a lower busbw.
+
+`--bw alg` prints algbw instead, `--bw both` prints both tables, and
+`--bw none` prints neither. The header states S and the factor for the run.
+
+With `--csv FILE`, one row per (algorithm variant, size) is written. It
+includes `algbw_MBps` and `busbw_MBps` and, summed over the groups,
+`aggbw_MBps` and `aggbusbw_MBps`. Without `--split-mask` the summed columns
+equal the per-group ones. A variant
 label that names several swept tunables, such as `chain[seg=8K,fo=4]`,
 contains commas and is quoted (RFC 4180), so CSV readers such as pandas read it
 as one field.
@@ -248,12 +283,12 @@ Inside a group, ranks are ordered by world rank, and `--root` is the rank
   network and shared links, which is the point of the mode.
 * **Latency table:** a group's latency is the mean over its ranks. Each cell
   is the mean of that over the groups.
-* **Aggregate bandwidth table** (printed after the latency table): the sum over
-  groups of `bytes / group latency` in MB/s, where `bytes` follows the
-  per-collective meaning of "size" above.
+* **Aggregate bandwidth tables** (after the per-group bandwidth tables,
+  following `--bw`): the sum over groups of the group's busbw (or algbw, `S /
+  group latency`), in GB/s.
 * **CSV:** adds `groups`, `group_ranks`, `layout` (`consecutive`, `stride=K`
   or `random:p=P:seed=S`), `group_min_us` / `group_max_us` (the fastest and
-  slowest group) and `aggbw_MBps`.
+  slowest group), `aggbw_MBps` and `aggbusbw_MBps`.
 * `--check` verifies every group's result; deep-check findings and the error
   map are labelled `group G:`.
 
@@ -345,7 +380,7 @@ algorithms themselves are unchanged. All the transport-specific code is in
 | `mpi` | any CUDA-aware MPI | `MPI_Send`, `MPI_Irecv`, … | everywhere (default) |
 | `cray` | HPE Cray MPICH | `MPIX_Create_queue`, `MPIX_Enqueue_send/recv`, `MPIX_Enqueue_start` (trigger), `MPIX_Enqueue_wait` | Slingshot 11 (Perlmutter, Frontier) |
 | `mpich` | MPICH ≥ 4.1 with CUDA | `MPIX_Stream_create` (bound to the CUDA stream), `MPIX_Stream_comm_create`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` | any MPICH network (UCX on InfiniBand, OFI) |
-| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx) | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
+| `acx` | [NVIDIA MPI-ACX](https://github.com/NVIDIA/mpi-acx)  | `MPIX_Init`, `MPIX_{Isend,Irecv,Wait,Waitall}_enqueue` with `MPIX_QUEUE_CUDA_STREAM` | InfiniBand/RoCE with Open MPI, HPC-X, MVAPICH |
 
 * **Only messages to other nodes are queued** (`--st-peers inter`, the
   default). Messages to peers on the same node keep CUDA-aware MPI, which
@@ -822,8 +857,6 @@ replayer ignores the times. The simulator converters below use them.
 
 ### Simulators: LogGOPSim / ATLAHS (GOAL) and SST/macro (DUMPI)
 
-This is experimental.
-
 Two converters in `tools/` turn a trace into the input of a network
 simulator. They are plain Python 3 with no dependencies, and they write one
 schedule per recorded (algorithm, size). Peers become world ranks, so traces
@@ -896,7 +929,7 @@ They include the tunables (`-s`, `--fanout`, `-k`, `--max-reqs`,
 `--first-seg`), the fallbacks, and a recipe for fitting α, β and γ with collage
 itself.
 
-## Job runs
+## Job scripts 
 
 `scripts/` holds job scripts for three studies on 16–128 CPU or GPU nodes:
 every algorithm (`algos`), concurrent groups via `--split-mask` (`split`), and

@@ -11,13 +11,14 @@ raw/ folders written by the Perlmutter job scripts, or any `collage --csv` file.
 
 Figure kinds (--kind, comma separated, default all):
   latency   latency vs message size; one panel per node count; one line per algorithm
+  busbw     bus bandwidth (nccl-tests' busbw, GB/s) vs message size, same layout
   best      heatmap nodes x size: speedup of the best algorithm over native MPI,
             with the winner's name in each cell (+ best_algorithms.csv, the table view)
   scaling   latency vs node count at a few message sizes (also covers barrier)
-  layout    aggregate bandwidth vs size per algorithm, one line per group layout
+  layout    aggregate bandwidth (--bw: bus or alg) vs size per algorithm, one line per group layout
             (world / node / cross / stride:K / group:M / random:P, i.e. --split-mask
             variants; the "split" study)
-  random    aggregate bandwidth vs the randomisation p of --split-mask PPN:p, at a
+  random    aggregate bandwidth (--bw) vs the randomisation p of --split-mask PPN:p, at a
             few sizes (p = 0 is the node layout); one line per algorithm
   tunables  per algorithm with several tunable variants (segment size, fan-out,
             radix, max requests; the "tunables" study): heatmap variant x size of
@@ -182,9 +183,23 @@ def load(paths):
     # older CSVs (before nodes/ppn/buffers columns) still load
     for col, default in (("nodes", 1), ("ranks_per_node", 0), ("buffers", "host"), ("gpu_reduce", "-"), ("transport", "mpi"),
                          ("layout", "-"), ("tag", ""), ("groups", 1), ("aggbw_MBps", np.nan),
-                         ("group_ranks", 0)):
+                         ("algbw_MBps", np.nan), ("group_ranks", 0)):
         if col not in df.columns:
             df[col] = default
+    # bus bandwidth (CSV columns since collage added them; derived for older files)
+    for c in ("algbw_MBps", "aggbw_MBps", "group_ranks", "ranks"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    n = df["group_ranks"].where(df["group_ranks"] > 0, df["ranks"]).astype(float)
+    factor = pd.Series(1.0, index=df.index)
+    factor[df["collective"] == "allreduce"] = 2 * (n - 1) / n
+    nm1 = df["collective"].isin(["allgather", "allgatherv", "alltoall", "alltoallv", "gather", "scatter",
+                                 "reduce_scatter", "reduce_scatter_block"])
+    factor[nm1] = (n - 1) / n
+    factor[df["collective"] == "barrier"] = 0.0
+    if "busbw_MBps" not in df.columns:
+        df["busbw_MBps"] = df["algbw_MBps"] * factor
+    if "aggbusbw_MBps" not in df.columns:
+        df["aggbusbw_MBps"] = df["aggbw_MBps"] * factor
     if (df["ranks_per_node"] == 0).any():
         df.loc[df["ranks_per_node"] == 0, "ranks_per_node"] = df["ranks"] // df["nodes"].clip(lower=1)
 
@@ -208,12 +223,13 @@ def load(paths):
     df["study"] = df["tag"].astype(str).str.extract(r"study=([^;]+)", expand=False).fillna("-")
 
     df = df[df["status"].isin(["ok"])].copy()
-    for c in ("avg_us", "aggbw_MBps", "bytes", "nodes", "ranks_per_node", "ranks"):
+    for c in ("avg_us", "aggbw_MBps", "busbw_MBps", "aggbusbw_MBps", "bytes", "nodes", "ranks_per_node", "ranks"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     # repeated measurements of the same case (re-runs): keep the median
     keys = ["collective", "algorithm", "variant", "nodes", "bytes"] + CONFIG_COLS
     df = df.groupby(keys, as_index=False, dropna=False).agg(
-        avg_us=("avg_us", "median"), aggbw_MBps=("aggbw_MBps", "median"), ranks=("ranks", "first"))
+        avg_us=("avg_us", "median"), aggbw_MBps=("aggbw_MBps", "median"), busbw_MBps=("busbw_MBps", "median"),
+        aggbusbw_MBps=("aggbusbw_MBps", "median"), ranks=("ranks", "first"))
     return df
 
 
@@ -328,12 +344,20 @@ def save(fig, outdir, name, formats):
 # figure kinds
 # --------------------------------------------------------------------------
 def fig_latency(df, a):
+    return fig_vs_size(df, a, "avg_us", 1.0, "latency (µs)", "latency", "latency")
+
+
+def fig_busbw(df, a):
+    return fig_vs_size(df, a, "busbw_MBps", 1e-3, "bus bandwidth (GB/s)", "bus bandwidth", "busbw", positive=True)
+
+
+def fig_vs_size(df, a, ycol, scale, ylabel, what, subdir, positive=False):
     made = []
     for coll, dc in df[df["collective"] != "barrier"].groupby("collective"):
         groups, cols = config_groups(dc)
         for key, d in groups:
             nodes = sorted(d["nodes"].unique())
-            sizes = sorted(d["bytes"].unique())
+            sizes = sorted(b for b in d["bytes"].unique() if not (positive and b == 0))
             if len(sizes) < 2:
                 continue
             styles = series_styles(coll, variants_of(d))
@@ -346,10 +370,12 @@ def fig_latency(df, a):
                 pos = size_axis(ax, sizes)
                 for var in order:
                     s = dn[dn["variant"] == var].sort_values("bytes")
+                    if positive:
+                        s = s[s[ycol] > 0]  # 0 B has no bandwidth
                     if s.empty:
                         continue
                     st = styles[var]
-                    ax.plot([pos[b] for b in s["bytes"]], s["avg_us"], color=st["color"], ls=st["ls"],
+                    ax.plot([pos[b] for b in s["bytes"]], s[ycol] * scale, color=st["color"], ls=st["ls"],
                             marker=st["marker"], lw=st["lw"], zorder=st["zorder"],
                             markeredgecolor=SURFACE, markeredgewidth=0.8)
                 plain_log_y(ax)
@@ -358,13 +384,13 @@ def fig_latency(df, a):
             for ax in axes.flat[len(nodes):]:
                 ax.set_visible(False)
             for ax in axes[:, 0]:
-                ax.set_ylabel("latency (µs)")
+                ax.set_ylabel(ylabel)
             fig.legend(handles=legend_handles(styles, order), loc="center left", bbox_to_anchor=(1.0, 0.5),
                        title="algorithm")
-            fig.suptitle(f"{coll}: latency vs message size  ·  {config_label(cols, key)}", x=0.02, ha="left",
+            fig.suptitle(f"{coll}: {what} vs message size  ·  {config_label(cols, key)}", x=0.02, ha="left",
                          fontsize=11, color=INK)
             fig.tight_layout()
-            made.append(save(fig, os.path.join(a.out, "latency"), f"{coll}__{config_slug(cols, key)}", a.formats))
+            made.append(save(fig, os.path.join(a.out, subdir), f"{coll}__{config_slug(cols, key)}", a.formats))
     return made
 
 
@@ -498,9 +524,10 @@ def fig_vs(df, a, xcol, xlabel, kind):
 
 
 def fig_layout(df, a):
-    """aggregate bandwidth per layout, small multiples per algorithm"""
+    """aggregate bandwidth (--bw) per layout, small multiples per algorithm"""
+    bwcol, bwname = ("aggbusbw_MBps", "aggregate bus bandwidth") if a.bw == "bus" else ("aggbw_MBps", "aggregate bandwidth")
     made = []
-    d0 = df[(df["collective"] != "barrier") & df["aggbw_MBps"].notna()]
+    d0 = df[(df["collective"] != "barrier") & df[bwcol].notna()]
     for coll, dc in d0.groupby("collective"):
         groups, cols = config_groups(dc, extra_drop=("layoutname",))
         for key, d in groups:
@@ -524,11 +551,11 @@ def fig_layout(df, a):
                     pos = size_axis(ax, sizes)
                     for l in layouts:
                         s = dv[dv["layoutname"] == l].sort_values("bytes")
-                        s = s[s["aggbw_MBps"] > 0]
+                        s = s[s[bwcol] * 1e-3 > 0]
                         if s.empty:
                             continue
                         st = lst[l]
-                        ax.plot([pos[b] for b in s["bytes"]], s["aggbw_MBps"], color=st["color"], ls=st["ls"],
+                        ax.plot([pos[b] for b in s["bytes"]], s[bwcol] * 1e-3, color=st["color"], ls=st["ls"],
                                 marker=st["marker"], lw=1.8 if l == "world" else 1.5, markeredgecolor=SURFACE,
                                 markeredgewidth=0.8, zorder=4 if l == "world" else 3)
                     plain_log_y(ax)
@@ -536,7 +563,7 @@ def fig_layout(df, a):
                 for ax in axes.flat[len(variants):]:
                     ax.set_visible(False)
                 for ax in axes[:, 0]:
-                    ax.set_ylabel("aggregate bandwidth (MB/s)")
+                    ax.set_ylabel(f"{bwname} (GB/s)")
                 handles = [Line2D([], [], color=lst[l]["color"], ls=lst[l]["ls"], marker=lst[l]["marker"], lw=1.5,
                                   markeredgecolor=SURFACE, label=l) for l in layouts]
                 fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5), title="group layout")
@@ -637,9 +664,10 @@ def fig_transport(df, a):
 
 
 def fig_random(df, a):
-    """aggregate bandwidth vs p of --split-mask PPN:p (node layout = p 0), at a few sizes"""
+    """aggregate bandwidth (--bw) vs p of --split-mask PPN:p (node layout = p 0), at a few sizes"""
+    bwcol, bwname = ("aggbusbw_MBps", "aggregate bus bandwidth") if a.bw == "bus" else ("aggbw_MBps", "aggregate bandwidth")
     made = []
-    d0 = df[(df["collective"] != "barrier") & df["aggbw_MBps"].notna() & (df["bytes"] > 0)].copy()
+    d0 = df[(df["collective"] != "barrier") & df[bwcol].notna() & (df["bytes"] > 0)].copy()
     d0["p"] = d0["layoutname"].map(random_p)
     d0.loc[d0["layoutname"] == "node", "p"] = 0.0
     d0 = d0.dropna(subset=["p"])
@@ -658,11 +686,11 @@ def fig_random(df, a):
                 for ax, b in zip(axes[0], sizes):
                     db = dn[dn["bytes"] == b]
                     for var in order:
-                        s = db[(db["variant"] == var) & (db["aggbw_MBps"] > 0)].sort_values("p")
+                        s = db[(db["variant"] == var) & (db[bwcol] > 0)].sort_values("p")
                         if s.empty:
                             continue
                         st = styles[var]
-                        ax.plot(s["p"], s["aggbw_MBps"], color=st["color"], ls=st["ls"], marker=st["marker"],
+                        ax.plot(s["p"], s[bwcol] * 1e-3, color=st["color"], ls=st["ls"], marker=st["marker"],
                                 lw=st["lw"], zorder=st["zorder"], markeredgecolor=SURFACE, markeredgewidth=0.8)
                     plain_log_y(ax)
                     ax.set_xticks(ps)
@@ -670,7 +698,7 @@ def fig_random(df, a):
                     ax.set_xlim(-0.04, max(ps) + 0.04)
                     ax.set_xlabel("p in --split-mask PPN:p")
                     ax.set_title(f"{human_bytes(b)} bytes")
-                axes[0][0].set_ylabel("aggregate bandwidth (MB/s)")
+                axes[0][0].set_ylabel(f"{bwname} (GB/s)")
                 fig.legend(handles=legend_handles(styles, order), loc="center left", bbox_to_anchor=(1.0, 0.5),
                            title="algorithm")
                 fig.suptitle(f"{coll}: randomised groups, {int(n)} nodes (p = 0: one group per node)  ·  "
@@ -782,11 +810,13 @@ def main():
     ap.add_argument("--op", help="only these reduction ops")
     ap.add_argument("--type", help="only these datatypes")
     ap.add_argument("--sizes", help="message sizes for scaling/ppn/random panels (bytes, comma list)")
+    ap.add_argument("--bw", choices=["bus", "alg"], default="bus",
+                    help="bandwidth in the layout/random figures: bus (busbw, default) or alg (algbw)")
     ap.add_argument("--max-cols", type=int, default=4, help="panels per row (default 4)")
     ap.add_argument("--max-panels", type=int, default=12, help="algorithm panels in layout/tunables figures")
     a = ap.parse_args()
     a.formats = a.formats.split(",")
-    kinds = (["latency", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers", "transport"]
+    kinds = (["latency", "busbw", "best", "scaling", "layout", "random", "tunables", "ppn", "buffers", "transport"]
              if a.kind == "all" else a.kind.split(","))
 
     theme()
@@ -801,6 +831,8 @@ def main():
     for k in kinds:
         if k == "latency":
             made = fig_latency(df, a)
+        elif k == "busbw":
+            made = fig_busbw(df, a)
         elif k == "best":
             made = fig_best(df, a)
         elif k == "scaling":

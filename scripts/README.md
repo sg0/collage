@@ -24,12 +24,12 @@ studies, and each one has a CPU-node script and a GPU-node script.
 
 ```bash
 cd $HOME/proj/collage          # or set COLLAGE_HOME to wherever the sources are
-scripts/build_perlmutter.sh # both binaries; or: cpu | gpu
+perlmutter/build_perlmutter.sh # both binaries; or: cpu | gpu
 ```
 
 To also compile in Cray MPICH's stream-triggered transport (`--transport
 cray`, see the main README), build the GPU binary with
-`ST=cray scripts/build_perlmutter.sh gpu`. The plain transport stays
+`ST=cray perlmutter/build_perlmutter.sh gpu`. The plain transport stays
 available in that binary, so `TRANSPORTS="mpi cray"` compares both in one job.
 Whether the installed Cray MPICH supports these queues with CUDA streams is
 not confirmed: HPE documents them with HIP streams. Run a short `--check` job
@@ -43,11 +43,11 @@ reduction kernels are built for `sm_80`.
 ## 2. Submit
 
 ```bash
-scripts/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
-scripts/submit_study.sh split gpu
-scripts/submit_study.sh all both        # every study on both node types: 24 jobs
+perlmutter/submit_study.sh algos cpu       # 16, 32, 64, 128 CPU nodes: 4 jobs
+perlmutter/submit_study.sh split gpu
+perlmutter/submit_study.sh all both        # every study on both node types: 24 jobs
 NODE_COUNTS="16 128" TIME=08:00:00 perlmutter/submit_study.sh tunables cpu
-sbatch -N 64 scripts/collage_split_cpu.sbatch   # a single job
+sbatch -N 64 perlmutter/collage_split_cpu.sbatch   # a single job
 ```
 
 All scripts use account `m4626` and `-q regular`. Override these with
@@ -56,13 +56,13 @@ at most 8 nodes and 30 minutes, so it suits a smoke test:
 
 ```bash
 NODE_COUNTS=2 QOS=debug TIME=00:20:00 COLLS=allreduce PPN_LIST=128 \
-    scripts/submit_study.sh algos cpu
+    perlmutter/submit_study.sh algos cpu
 ```
 
 To print the plan without running anything (on a login node):
 
 ```bash
-DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash scripts/collage_split_cpu.sbatch
+DRYRUN=1 SLURM_JOB_NUM_NODES=128 bash perlmutter/collage_split_cpu.sbatch
 ```
 
 ### Resubmit until done
@@ -154,7 +154,7 @@ Requirements: `python3` with pandas, matplotlib and seaborn. On Perlmutter,
 
 ```bash
 python3 plots/plot_collage.py $SCRATCH/collage_study -o figs            # every figure
-python3 plots/plot_collage.py $SCRATCH/collage_study/algos -o figs/algos --kind latency,best,scaling,ppn
+python3 plots/plot_collage.py $SCRATCH/collage_study/algos -o figs/algos --kind latency,busbw,best,scaling,ppn
 python3 plots/plot_collage.py $SCRATCH/collage_study --study split -o figs/split --kind layout,random
 python3 plots/plot_collage.py $SCRATCH/collage_study --study tunables -o figs/tunables --kind tunables
 python3 plots/plot_collage.py $SCRATCH/collage_study --study algos --kind buffers --nodes 128 -o figs/gpu
@@ -163,13 +163,14 @@ python3 plots/plot_collage.py $SCRATCH/collage_study --study algos --kind buffer
 | kind | figure |
 |---|---|
 | `latency` | latency vs size, one panel per node count, one line per algorithm (native: black dashed) |
+| `busbw` | bus bandwidth (nccl-tests' busbw, GB/s) vs size, same panels as `latency` |
 | `best` | heatmap nodes × size: the fastest algorithm in each cell, coloured by its speedup over native (+ `best_algorithms.csv`) |
 | `scaling` | latency vs node count at a few sizes (`--sizes 1K,64K,4M`) |
 | `ppn` | latency vs processes per node, per node count (CPU) |
 | `buffers` | host-buffer latency / GPU-buffer latency vs size (GPU `algos` study) |
 | `transport` | CUDA-aware MPI latency / stream-triggered latency vs size, one figure set per transport (GPU runs with `TRANSPORTS="mpi cray"`) |
-| `layout` | aggregate bandwidth vs size, one panel per algorithm, one line per layout (`split`) |
-| `random` | aggregate bandwidth vs p of `PPN:p`, with p = 0 for the `node` layout, one line per algorithm (`split`) |
+| `layout` | aggregate bus bandwidth (`--bw alg`: algbw) vs size, one panel per algorithm, one line per layout (`split`) |
+| `random` | aggregate bus bandwidth (`--bw alg`: algbw) vs p of `PPN:p`, with p = 0 for the `node` layout, one line per algorithm (`split`) |
 | `tunables` | per algorithm: rows of tunable settings × sizes, latency relative to the fastest row (native included), ● marks the fastest (+ `tunables_best.csv`) |
 
 Filters: `--study --coll --algos --nodes --ppn --layout --buffers --transport --gpu-reduce
