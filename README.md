@@ -1,4 +1,4 @@
-# collage — collective algorithm benchmark
+## COLLAGE — COLLective AlGorithm bEnchmark
 
 `collage` benchmarks the collective algorithms from Open MPI's `coll/base`
 component (commit `ec987ee891f9d9b91f21edde9eab3f991634f57d`). Each algorithm
